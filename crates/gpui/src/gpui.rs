@@ -332,8 +332,180 @@ where
     }
 }
 
+/// Selects the renderer used to draw GPUI windows.
+#[derive(
+    Default,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RendererPreference {
+    /// Prefer hardware rendering and fall back to software rendering when needed.
+    #[default]
+    Auto,
+    /// Render and present windows entirely on the CPU.
+    Software,
+}
+
+/// The renderer currently drawing a GPUI window.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RendererBackend {
+    /// A hardware-accelerated platform renderer.
+    Hardware,
+    /// The GPUI CPU renderer.
+    Software,
+}
+
+/// Whether a compatible hardware renderer is available for a window.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareAvailability {
+    /// A compatible hardware renderer initialized successfully.
+    Available,
+    /// Hardware rendering was attempted but could not be initialized.
+    Unavailable,
+    /// Hardware rendering was not inspected because software rendering was requested.
+    NotProbed,
+}
+
+/// The stage at which hardware renderer initialization failed.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RendererFallbackReason {
+    /// No compatible hardware adapter was found.
+    NoHardwareAdapter,
+    /// A hardware device could not be created.
+    DeviceInitialization,
+    /// The initial presentation surface could not be created.
+    SurfaceInitialization,
+}
+
+/// Controls whether GPUI should run nonessential visual animations.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimationPolicy {
+    /// Render all animations normally.
+    Full,
+    /// Reduce decorative animations while preserving functional time-varying content.
+    Reduced,
+}
+
+/// Rendering features available to a GPUI window.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct RenderingCapabilities {
+    /// Whether the renderer can preserve transparency through window presentation.
+    pub transparency: bool,
+    /// The animation behavior appropriate for this renderer.
+    pub animation_policy: AnimationPolicy,
+}
+
+impl RenderingCapabilities {
+    /// Returns the capabilities of the existing hardware renderers.
+    pub const fn hardware() -> Self {
+        Self {
+            transparency: true,
+            animation_policy: AnimationPolicy::Full,
+        }
+    }
+
+    /// Returns the capabilities of the CPU renderer.
+    pub const fn software() -> Self {
+        Self {
+            transparency: false,
+            animation_policy: AnimationPolicy::Reduced,
+        }
+    }
+}
+
+/// Describes renderer selection and the active renderer for a GPUI window.
+#[derive(
+    Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+pub struct RenderingInfo {
+    /// The renderer preference used when creating the platform.
+    pub requested_preference: RendererPreference,
+    /// The renderer that currently draws the window.
+    pub active_backend: RendererBackend,
+    /// Whether hardware rendering is known to be available.
+    pub hardware_availability: HardwareAvailability,
+    /// Hardware adapter details, when a hardware renderer exposed them.
+    pub gpu_specs: Option<GpuSpecs>,
+    /// Why automatic renderer selection fell back to software rendering.
+    pub fallback_reason: Option<RendererFallbackReason>,
+    /// Rendering features available to the window.
+    pub capabilities: RenderingCapabilities,
+}
+
+impl RenderingInfo {
+    /// Describes a successfully initialized hardware renderer.
+    pub fn hardware(gpu_specs: Option<GpuSpecs>) -> Self {
+        Self {
+            requested_preference: RendererPreference::Auto,
+            active_backend: RendererBackend::Hardware,
+            hardware_availability: HardwareAvailability::Available,
+            gpu_specs,
+            fallback_reason: None,
+            capabilities: RenderingCapabilities::hardware(),
+        }
+    }
+
+    /// Describes a software renderer and the result of hardware selection.
+    pub fn software(
+        requested_preference: RendererPreference,
+        hardware_availability: HardwareAvailability,
+        fallback_reason: Option<RendererFallbackReason>,
+    ) -> Self {
+        Self {
+            requested_preference,
+            active_backend: RendererBackend::Software,
+            hardware_availability,
+            gpu_specs: None,
+            fallback_reason,
+            capabilities: RenderingCapabilities::software(),
+        }
+    }
+}
+
+/// Options used to construct GPUI's platform implementation.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformOptions {
+    /// Whether to initialize the platform for headless use.
+    pub headless: bool,
+    /// The renderer preference for subsequently created windows.
+    pub renderer_preference: RendererPreference,
+}
+
+impl PlatformOptions {
+    /// Returns platform options using automatic renderer selection.
+    pub const fn auto(headless: bool) -> Self {
+        Self {
+            headless,
+            renderer_preference: RendererPreference::Auto,
+        }
+    }
+}
+
 /// Information about the GPU GPUI is running on.
-#[derive(Default, Debug, serde::Serialize, serde::Deserialize, Clone)]
+#[derive(
+    Default, Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq, schemars::JsonSchema,
+)]
 pub struct GpuSpecs {
     /// Whether the GPU is really a fake (like `llvmpipe`) running on the CPU.
     pub is_software_emulated: bool,
@@ -343,4 +515,51 @@ pub struct GpuSpecs {
     pub driver_name: String,
     /// Further information about the driver, as reported by Vulkan.
     pub driver_info: String,
+}
+
+#[cfg(test)]
+mod rendering_tests {
+    use super::*;
+
+    #[test]
+    fn rendering_info_hardware_preserves_gpu_specs() {
+        let gpu_specs = GpuSpecs {
+            device_name: "Test GPU".to_string(),
+            ..GpuSpecs::default()
+        };
+
+        let info = RenderingInfo::hardware(Some(gpu_specs.clone()));
+
+        assert_eq!(info.requested_preference, RendererPreference::Auto);
+        assert_eq!(info.active_backend, RendererBackend::Hardware);
+        assert_eq!(info.hardware_availability, HardwareAvailability::Available);
+        assert_eq!(info.gpu_specs, Some(gpu_specs));
+        assert_eq!(info.fallback_reason, None);
+        assert_eq!(info.capabilities, RenderingCapabilities::hardware());
+    }
+
+    #[test]
+    fn rendering_info_software_reports_reduced_capabilities() {
+        let info = RenderingInfo::software(
+            RendererPreference::Auto,
+            HardwareAvailability::Unavailable,
+            Some(RendererFallbackReason::NoHardwareAdapter),
+        );
+
+        assert_eq!(info.active_backend, RendererBackend::Software);
+        assert_eq!(
+            info.hardware_availability,
+            HardwareAvailability::Unavailable
+        );
+        assert_eq!(
+            info.fallback_reason,
+            Some(RendererFallbackReason::NoHardwareAdapter)
+        );
+        assert_eq!(info.capabilities, RenderingCapabilities::software());
+    }
+
+    #[test]
+    fn platform_options_default_to_automatic_hardware_selection() {
+        assert_eq!(PlatformOptions::default(), PlatformOptions::auto(false));
+    }
 }

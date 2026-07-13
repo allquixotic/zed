@@ -39,8 +39,8 @@ use crate::{
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, Font, FontId, FontMetrics,
     FontRun, ForegroundExecutor, GlyphId, GpuSpecs, Hsla, ImageSource, Keymap, LineLayout, Pixels,
     PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString, Size,
-    SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+    RenderImageParams, RenderSvgParams, RenderingInfo, Scene, ShapedGlyph, ShapedRun, SharedString,
+    Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
 };
 use anyhow::Result;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -813,6 +813,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     fn window_controls(&self) -> WindowControls {
         WindowControls::default()
+    }
+    fn rendering_info(&self) -> RenderingInfo {
+        RenderingInfo::hardware(self.gpu_specs())
     }
     fn set_client_inset(&self, _inset: Pixels) {}
     fn gpu_specs(&self) -> Option<GpuSpecs>;
