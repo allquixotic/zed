@@ -774,6 +774,7 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub frame_revision: u64,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
 }
@@ -798,9 +799,88 @@ pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub content_mask: ContentMask<P>,
     pub vertices: Vec<PathVertex<P>>,
     pub color: Background,
+    commands: Vec<PathCommand<P>>,
+    paint: PathPaint,
+    has_triangle_fallback: bool,
     start: Point<P>,
     current: Point<P>,
     contour_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[expect(missing_docs)]
+pub enum PathCommand<P: Clone + Debug + Default + PartialEq> {
+    MoveTo(Point<P>),
+    LineTo(Point<P>),
+    QuadraticTo {
+        control: Point<P>,
+        to: Point<P>,
+    },
+    CubicTo {
+        control_1: Point<P>,
+        control_2: Point<P>,
+        to: Point<P>,
+    },
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(missing_docs)]
+pub enum PathFillRule {
+    #[default]
+    NonZero,
+    EvenOdd,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(missing_docs)]
+pub enum PathLineCap {
+    #[default]
+    Butt,
+    Round,
+    Square,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[expect(missing_docs)]
+pub enum PathLineJoin {
+    #[default]
+    Miter,
+    Round,
+    Bevel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[expect(missing_docs)]
+pub struct PathStroke {
+    pub width: f32,
+    pub miter_limit: f32,
+    pub line_cap: PathLineCap,
+    pub line_join: PathLineJoin,
+}
+
+impl Default for PathStroke {
+    fn default() -> Self {
+        Self {
+            width: 1.0,
+            miter_limit: 4.0,
+            line_cap: PathLineCap::Butt,
+            line_join: PathLineJoin::Miter,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[expect(missing_docs)]
+pub enum PathPaint {
+    Fill(PathFillRule),
+    Stroke(PathStroke),
+}
+
+impl Default for PathPaint {
+    fn default() -> Self {
+        Self::Fill(PathFillRule::NonZero)
+    }
 }
 
 impl Path<Pixels> {
@@ -818,6 +898,9 @@ impl Path<Pixels> {
             },
             content_mask: Default::default(),
             color: Default::default(),
+            commands: vec![PathCommand::MoveTo(start)],
+            paint: PathPaint::default(),
+            has_triangle_fallback: false,
             contour_count: 0,
         }
     }
@@ -834,6 +917,19 @@ impl Path<Pixels> {
                 .iter()
                 .map(|vertex| vertex.scale(factor))
                 .collect(),
+            commands: self
+                .commands
+                .iter()
+                .map(|command| command.scale(factor))
+                .collect(),
+            paint: match self.paint {
+                PathPaint::Fill(rule) => PathPaint::Fill(rule),
+                PathPaint::Stroke(mut stroke) => {
+                    stroke.width *= factor;
+                    PathPaint::Stroke(stroke)
+                }
+            },
+            has_triangle_fallback: self.has_triangle_fallback,
             start: self.start.map(|start| start.scale(factor)),
             current: self.current.scale(factor),
             contour_count: self.contour_count,
@@ -846,39 +942,125 @@ impl Path<Pixels> {
         self.contour_count += 1;
         self.start = to;
         self.current = to;
+        self.include_point(to);
+        self.commands.push(PathCommand::MoveTo(to));
     }
 
     /// Draw a straight line from the current point to the given point.
     pub fn line_to(&mut self, to: Point<Pixels>) {
         self.contour_count += 1;
         if self.contour_count > 1 {
-            self.push_triangle(
+            self.push_triangle_impl(
                 (self.start, self.current, to),
                 (point(0., 1.), point(0., 1.), point(0., 1.)),
             );
         }
         self.current = to;
+        self.include_point(to);
+        self.commands.push(PathCommand::LineTo(to));
     }
 
     /// Draw a curve from the current point to the given point, using the given control point.
     pub fn curve_to(&mut self, to: Point<Pixels>, ctrl: Point<Pixels>) {
         self.contour_count += 1;
         if self.contour_count > 1 {
-            self.push_triangle(
+            self.push_triangle_impl(
                 (self.start, self.current, to),
                 (point(0., 1.), point(0., 1.), point(0., 1.)),
             );
         }
 
-        self.push_triangle(
+        self.push_triangle_impl(
             (self.current, ctrl, to),
             (point(0., 0.), point(0.5, 0.), point(1., 1.)),
         );
         self.current = to;
+        self.include_point(ctrl);
+        self.include_point(to);
+        self.commands
+            .push(PathCommand::QuadraticTo { control: ctrl, to });
+    }
+
+    /// Draw a cubic Bézier curve from the current point to the given point.
+    pub fn cubic_curve_to(
+        &mut self,
+        to: Point<Pixels>,
+        control_1: Point<Pixels>,
+        control_2: Point<Pixels>,
+    ) {
+        let from = self.current;
+        for step in 1..=16 {
+            let amount = step as f32 / 16.0;
+            let inverse = 1.0 - amount;
+            let point = Point {
+                x: from.x * inverse.powi(3)
+                    + control_1.x * (3.0 * inverse.powi(2) * amount)
+                    + control_2.x * (3.0 * inverse * amount.powi(2))
+                    + to.x * amount.powi(3),
+                y: from.y * inverse.powi(3)
+                    + control_1.y * (3.0 * inverse.powi(2) * amount)
+                    + control_2.y * (3.0 * inverse * amount.powi(2))
+                    + to.y * amount.powi(3),
+            };
+            self.line_to_for_tessellation(point);
+        }
+        self.current = to;
+        self.include_point(control_1);
+        self.include_point(control_2);
+        self.include_point(to);
+        self.commands.push(PathCommand::CubicTo {
+            control_1,
+            control_2,
+            to,
+        });
+    }
+
+    /// Close the current contour.
+    pub fn close(&mut self) {
+        self.current = self.start;
+        self.commands.push(PathCommand::Close);
+    }
+
+    /// Set the fill rule used by renderers with canonical path support.
+    pub fn set_fill_rule(&mut self, fill_rule: PathFillRule) {
+        self.paint = PathPaint::Fill(fill_rule);
+    }
+
+    /// Set the stroke used by renderers with canonical path support.
+    pub fn set_stroke(&mut self, stroke: PathStroke) {
+        self.paint = PathPaint::Stroke(stroke);
+    }
+
+    fn line_to_for_tessellation(&mut self, to: Point<Pixels>) {
+        self.contour_count += 1;
+        if self.contour_count > 1 {
+            self.push_triangle_impl(
+                (self.start, self.current, to),
+                (point(0., 1.), point(0., 1.), point(0., 1.)),
+            );
+        }
+        self.current = to;
+        self.include_point(to);
+    }
+
+    fn include_point(&mut self, point: Point<Pixels>) {
+        self.bounds = self.bounds.union(&Bounds {
+            origin: point,
+            size: Default::default(),
+        });
     }
 
     /// Push a triangle to the Path.
     pub fn push_triangle(
+        &mut self,
+        xy: (Point<Pixels>, Point<Pixels>, Point<Pixels>),
+        st: (Point<f32>, Point<f32>, Point<f32>),
+    ) {
+        self.has_triangle_fallback = true;
+        self.push_triangle_impl(xy, st);
+    }
+
+    fn push_triangle_impl(
         &mut self,
         xy: (Point<Pixels>, Point<Pixels>, Point<Pixels>),
         st: (Point<f32>, Point<f32>, Point<f32>),
@@ -916,6 +1098,49 @@ impl Path<Pixels> {
     }
 }
 
+impl<P> Path<P>
+where
+    P: Clone + Debug + Default + PartialEq,
+{
+    /// Return the renderer-neutral path commands.
+    pub fn commands(&self) -> &[PathCommand<P>] {
+        &self.commands
+    }
+
+    /// Return the fill or stroke parameters for this path.
+    pub fn paint(&self) -> PathPaint {
+        self.paint
+    }
+
+    /// Return whether explicit triangle geometry must be used instead of the canonical commands.
+    pub fn uses_triangle_fallback(&self) -> bool {
+        self.has_triangle_fallback
+    }
+}
+
+impl PathCommand<Pixels> {
+    fn scale(&self, factor: f32) -> PathCommand<ScaledPixels> {
+        match self {
+            PathCommand::MoveTo(point) => PathCommand::MoveTo(point.scale(factor)),
+            PathCommand::LineTo(point) => PathCommand::LineTo(point.scale(factor)),
+            PathCommand::QuadraticTo { control, to } => PathCommand::QuadraticTo {
+                control: control.scale(factor),
+                to: to.scale(factor),
+            },
+            PathCommand::CubicTo {
+                control_1,
+                control_2,
+                to,
+            } => PathCommand::CubicTo {
+                control_1: control_1.scale(factor),
+                control_2: control_2.scale(factor),
+                to: to.scale(factor),
+            },
+            PathCommand::Close => PathCommand::Close,
+        }
+    }
+}
+
 impl<T> Path<T>
 where
     T: Clone + Debug + Default + PartialEq + PartialOrd + Add<T, Output = T> + Sub<Output = T>,
@@ -930,6 +1155,72 @@ where
 impl From<Path<ScaledPixels>> for Primitive {
     fn from(path: Path<ScaledPixels>) -> Self {
         Primitive::Path(path)
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{
+        Path, PathCommand, PathFillRule, PathLineCap, PathLineJoin, PathPaint, PathStroke,
+    };
+    use crate::{ScaledPixels, point, px};
+
+    #[test]
+    fn path_retains_canonical_commands_and_explicit_triangle_fallback() {
+        let mut path = Path::new(point(px(1.0), px(2.0)));
+        path.line_to(point(px(3.0), px(4.0)));
+        path.curve_to(point(px(7.0), px(8.0)), point(px(5.0), px(6.0)));
+        path.cubic_curve_to(
+            point(px(13.0), px(14.0)),
+            point(px(9.0), px(10.0)),
+            point(px(11.0), px(12.0)),
+        );
+        path.close();
+        path.set_fill_rule(PathFillRule::EvenOdd);
+
+        assert!(matches!(
+            path.commands(),
+            [
+                PathCommand::MoveTo(_),
+                PathCommand::LineTo(_),
+                PathCommand::QuadraticTo { .. },
+                PathCommand::CubicTo { .. },
+                PathCommand::Close,
+            ]
+        ));
+        assert_eq!(path.paint(), PathPaint::Fill(PathFillRule::EvenOdd));
+        assert!(!path.uses_triangle_fallback());
+
+        let stroke = PathStroke {
+            width: 2.0,
+            miter_limit: 3.0,
+            line_cap: PathLineCap::Round,
+            line_join: PathLineJoin::Bevel,
+        };
+        path.set_stroke(stroke);
+        let scaled = path.scale(2.0);
+        assert_eq!(
+            scaled.paint(),
+            PathPaint::Stroke(PathStroke {
+                width: 4.0,
+                ..stroke
+            })
+        );
+        assert!(matches!(
+            scaled.commands().get(1),
+            Some(PathCommand::LineTo(to))
+                if *to == point(ScaledPixels(6.0), ScaledPixels(8.0))
+        ));
+
+        path.push_triangle(
+            (
+                point(px(0.0), px(0.0)),
+                point(px(1.0), px(0.0)),
+                point(px(0.0), px(1.0)),
+            ),
+            (point(0.0, 0.0), point(0.0, 1.0), point(1.0, 1.0)),
+        );
+        assert!(path.uses_triangle_fallback());
     }
 }
 

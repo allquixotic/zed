@@ -519,7 +519,10 @@ pub struct GpuSpecs {
 
 #[cfg(test)]
 mod rendering_tests {
-    use super::*;
+    use super::{
+        GpuSpecs, HardwareAvailability, PlatformOptions, RendererBackend, RendererFallbackReason,
+        RendererPreference, RenderingCapabilities, RenderingInfo,
+    };
 
     #[test]
     fn rendering_info_hardware_preserves_gpu_specs() {
