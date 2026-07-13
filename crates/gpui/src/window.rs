@@ -11,7 +11,7 @@ use crate::{
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
     Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    RenderImageParams, RenderSvgParams, RenderingInfo, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -5546,10 +5546,14 @@ impl Window {
         }
     }
 
+    /// Read renderer selection and capability information for this window.
+    pub fn rendering_info(&self) -> RenderingInfo {
+        self.platform_window.rendering_info()
+    }
+
     /// Read information about the GPU backing this window.
-    /// Currently returns None on Mac and Windows.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
-        self.platform_window.gpu_specs()
+        self.rendering_info().gpu_specs
     }
 
     /// Perform titlebar double-click action.

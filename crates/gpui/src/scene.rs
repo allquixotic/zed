@@ -30,9 +30,27 @@ pub type DrawOrder = u32;
 #[repr(transparent)]
 pub struct PaddedBool32(u32);
 
+impl PaddedBool32 {
+    /// Returns the boolean value stored in this padded representation.
+    pub const fn get(self) -> bool {
+        self.0 != 0
+    }
+}
+
 impl From<bool> for PaddedBool32 {
     fn from(value: bool) -> Self {
         PaddedBool32(value as u32)
+    }
+}
+
+#[cfg(test)]
+mod padded_bool_tests {
+    use super::PaddedBool32;
+
+    #[test]
+    fn padded_bool32_round_trips() {
+        assert!(!PaddedBool32::from(false).get());
+        assert!(PaddedBool32::from(true).get());
     }
 }
 
@@ -528,6 +546,13 @@ pub struct Underline {
     pub wavy: PaddedBool32,
 }
 
+impl Underline {
+    /// Returns whether this underline uses the wavy style.
+    pub const fn is_wavy(&self) -> bool {
+        self.wavy.get()
+    }
+}
+
 impl From<Underline> for Primitive {
     fn from(underline: Underline) -> Self {
         Primitive::Underline(underline)
@@ -549,6 +574,13 @@ pub struct Shadow {
     /// 0 = drop shadow (rendered outside the element), 1 = inset shadow (rendered inside).
     pub inset: u32,
     pub pad: u32, // align to 8 bytes
+}
+
+impl Shadow {
+    /// Returns whether this shadow is painted inside the element.
+    pub const fn is_inset(&self) -> bool {
+        self.inset != 0
+    }
 }
 
 impl From<Shadow> for Primitive {
@@ -721,6 +753,13 @@ pub struct PolychromeSprite {
     pub content_mask: ContentMask<ScaledPixels>,
     pub corner_radii: Corners<ScaledPixels>,
     pub tile: AtlasTile,
+}
+
+impl PolychromeSprite {
+    /// Returns whether this sprite is rendered in grayscale.
+    pub const fn is_grayscale(&self) -> bool {
+        self.grayscale.get()
+    }
 }
 
 impl From<PolychromeSprite> for Primitive {

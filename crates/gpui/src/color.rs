@@ -786,6 +786,38 @@ pub struct Background {
     pad: u32,
 }
 
+/// The renderer-neutral contents of a [`Background`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BackgroundKind {
+    /// A single solid color.
+    Solid(Hsla),
+    /// A two-stop linear gradient.
+    LinearGradient {
+        /// The clockwise direction of the gradient in degrees.
+        angle: f32,
+        /// The color space used to interpolate between the stops.
+        color_space: ColorSpace,
+        /// The two gradient stops.
+        stops: [LinearColorStop; 2],
+    },
+    /// Diagonal slashes repeated across the painted bounds.
+    PatternSlash {
+        /// The slash color.
+        color: Hsla,
+        /// The width of each slash.
+        width: f32,
+        /// The space between slashes.
+        interval: f32,
+    },
+    /// A checkerboard pattern alternating this color with transparency.
+    Checkerboard {
+        /// The checker color.
+        color: Hsla,
+        /// The width and height of each checker.
+        size: f32,
+    },
+}
+
 impl std::fmt::Debug for Background {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self.tag {
@@ -908,6 +940,27 @@ impl LinearColorStop {
 }
 
 impl Background {
+    /// Returns the semantic contents of this background.
+    pub fn kind(&self) -> BackgroundKind {
+        match self.tag {
+            BackgroundTag::Solid => BackgroundKind::Solid(self.solid),
+            BackgroundTag::LinearGradient => BackgroundKind::LinearGradient {
+                angle: self.gradient_angle_or_pattern_height,
+                color_space: self.color_space,
+                stops: self.colors,
+            },
+            BackgroundTag::PatternSlash => BackgroundKind::PatternSlash {
+                color: self.solid,
+                width: (self.gradient_angle_or_pattern_height / 65_535.0) / 255.0,
+                interval: (self.gradient_angle_or_pattern_height % 65_535.0) / 255.0,
+            },
+            BackgroundTag::Checkerboard => BackgroundKind::Checkerboard {
+                color: self.solid,
+                size: self.gradient_angle_or_pattern_height,
+            },
+        }
+    }
+
     /// Returns the solid color if this is a solid background, None otherwise.
     pub fn as_solid(&self) -> Option<Hsla> {
         if self.tag == BackgroundTag::Solid {
@@ -1041,6 +1094,44 @@ mod tests {
         assert_eq!(background.opacity(0.5).colors[1], to.opacity(0.5));
         assert!(!background.is_transparent());
         assert!(background.opacity(0.0).is_transparent());
+    }
+
+    #[test]
+    fn background_kind_exposes_semantic_fields() {
+        let from = linear_color_stop(rgba(0xff0099ff), 0.0);
+        let to = linear_color_stop(rgba(0x00ff99ff), 1.0);
+        assert_eq!(
+            linear_gradient(90.0, from, to)
+                .color_space(ColorSpace::Oklab)
+                .kind(),
+            BackgroundKind::LinearGradient {
+                angle: 90.0,
+                color_space: ColorSpace::Oklab,
+                stops: [from, to],
+            }
+        );
+
+        let color = hsla(0.5, 0.6, 0.7, 0.8);
+        match pattern_slash(color, 2.0, 3.0).kind() {
+            BackgroundKind::PatternSlash {
+                color: actual_color,
+                width,
+                interval,
+            } => {
+                assert_eq!(actual_color, color);
+                assert!((width - 2.0).abs() < 0.0001);
+                assert!((interval - 3.0).abs() < 0.0001);
+            }
+            actual => assert!(
+                matches!(actual, BackgroundKind::PatternSlash { .. }),
+                "expected slash pattern, got {actual:?}"
+            ),
+        }
+
+        assert_eq!(
+            checkerboard(color, 8.0).kind(),
+            BackgroundKind::Checkerboard { color, size: 8.0 }
+        );
     }
 
     #[test]

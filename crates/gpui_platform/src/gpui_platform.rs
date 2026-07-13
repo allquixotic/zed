@@ -1,7 +1,7 @@
 //! Convenience crate that re-exports GPUI's platform traits and the
 //! `current_platform` constructor so consumers don't need `#[cfg]` gating.
 
-pub use gpui::Platform;
+pub use gpui::{Platform, PlatformOptions};
 
 use std::rc::Rc;
 
@@ -59,6 +59,37 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
     }
 }
 
+/// Returns the default [`Platform`] for the current OS using the supplied options.
+pub fn current_platform_with_options(options: PlatformOptions) -> gpui::Result<Rc<dyn Platform>> {
+    try_current_platform(options)
+}
+
+/// Attempts to construct the default [`Platform`] for the current OS.
+pub fn try_current_platform(options: PlatformOptions) -> gpui::Result<Rc<dyn Platform>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Rc::new(gpui_macos::MacPlatform::new(options.headless)))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Rc::new(gpui_windows::WindowsPlatform::new(
+            options.headless,
+        )?))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        Ok(gpui_linux::current_platform(options.headless))
+    }
+
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = options;
+        Ok(Rc::new(gpui_web::WebPlatform::new(true)))
+    }
+}
+
 /// Returns a new [`HeadlessRenderer`] for the current platform, if available.
 #[cfg(feature = "test-support")]
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
@@ -72,6 +103,129 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
     #[cfg(not(target_os = "macos"))]
     {
         None
+    }
+}
+
+#[cfg(test)]
+mod renderer_contract_tests {
+    use super::*;
+    use gpui::{
+        AnimationPolicy, AtlasTextureId, AtlasTextureKind, AtlasTile, BackgroundKind, GpuSpecs,
+        HardwareAvailability, PolychromeSprite, RendererBackend, RendererFallbackReason,
+        RendererPreference, RenderingCapabilities, RenderingInfo, Shadow, TileId, Underline,
+        checkerboard, hsla, linear_color_stop, linear_gradient, pattern_slash, rgba,
+    };
+
+    #[test]
+    fn renderer_contract_reports_hardware_and_software_status() {
+        let gpu_specs = GpuSpecs {
+            device_name: "Test GPU".to_string(),
+            ..GpuSpecs::default()
+        };
+        let hardware = RenderingInfo::hardware(Some(gpu_specs.clone()));
+        assert_eq!(hardware.requested_preference, RendererPreference::Auto);
+        assert_eq!(hardware.active_backend, RendererBackend::Hardware);
+        assert_eq!(
+            hardware.hardware_availability,
+            HardwareAvailability::Available
+        );
+        assert_eq!(hardware.gpu_specs, Some(gpu_specs));
+        assert_eq!(hardware.fallback_reason, None);
+        assert_eq!(hardware.capabilities, RenderingCapabilities::hardware());
+
+        let software = RenderingInfo::software(
+            RendererPreference::Auto,
+            HardwareAvailability::Unavailable,
+            Some(RendererFallbackReason::NoHardwareAdapter),
+        );
+        assert_eq!(software.active_backend, RendererBackend::Software);
+        assert_eq!(software.gpu_specs, None);
+        assert_eq!(software.capabilities.transparency, false);
+        assert_eq!(
+            software.capabilities.animation_policy,
+            AnimationPolicy::Reduced
+        );
+    }
+
+    #[test]
+    fn renderer_contract_exposes_semantic_scene_values() {
+        assert!(gpui::PaddedBool32::from(true).get());
+        assert!(!gpui::PaddedBool32::from(false).get());
+
+        let from = linear_color_stop(rgba(0xff0099ff), 0.0);
+        let to = linear_color_stop(rgba(0x00ff99ff), 1.0);
+        assert_eq!(
+            linear_gradient(90.0, from, to).kind(),
+            BackgroundKind::LinearGradient {
+                angle: 90.0,
+                color_space: gpui::ColorSpace::Srgb,
+                stops: [from, to],
+            }
+        );
+
+        let color = hsla(0.5, 0.6, 0.7, 0.8);
+        assert!(matches!(
+            pattern_slash(color, 2.0, 3.0).kind(),
+            BackgroundKind::PatternSlash { .. }
+        ));
+        assert_eq!(
+            checkerboard(color, 8.0).kind(),
+            BackgroundKind::Checkerboard { color, size: 8.0 }
+        );
+
+        let underline = Underline {
+            order: 0,
+            pad: 0,
+            bounds: Default::default(),
+            content_mask: Default::default(),
+            color: Default::default(),
+            thickness: Default::default(),
+            wavy: true.into(),
+        };
+        assert!(underline.is_wavy());
+
+        let shadow = Shadow {
+            order: 0,
+            blur_radius: Default::default(),
+            bounds: Default::default(),
+            corner_radii: Default::default(),
+            content_mask: Default::default(),
+            color: Default::default(),
+            element_bounds: Default::default(),
+            element_corner_radii: Default::default(),
+            inset: 1,
+            pad: 0,
+        };
+        assert!(shadow.is_inset());
+
+        let sprite = PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: true.into(),
+            opacity: 1.0,
+            bounds: Default::default(),
+            content_mask: Default::default(),
+            corner_radii: Default::default(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Polychrome,
+                },
+                tile_id: TileId(0),
+                padding: 0,
+                bounds: Default::default(),
+            },
+        };
+        assert!(sprite.is_grayscale());
+    }
+
+    #[test]
+    fn renderer_contract_keeps_legacy_and_fallible_factories() {
+        let _: fn(bool) -> Rc<dyn Platform> = current_platform;
+        let _: fn(PlatformOptions) -> gpui::Result<Rc<dyn Platform>> =
+            current_platform_with_options;
+        let _: fn(PlatformOptions) -> gpui::Result<Rc<dyn Platform>> = try_current_platform;
+        assert_eq!(PlatformOptions::default(), PlatformOptions::auto(false));
     }
 }
 
