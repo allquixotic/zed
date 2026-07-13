@@ -5,6 +5,11 @@ use gpui::{
     PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
     Underline, get_gamma_correction_ratios,
 };
+#[cfg(not(target_family = "wasm"))]
+use gpui::{
+    CachedHardwareRendererInitializationError, HardwareRendererInitializationError,
+    RendererFallbackReason,
+};
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -102,7 +107,12 @@ struct WgpuBindGroupLayouts {
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
-pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
+#[derive(Clone, Default)]
+pub struct GpuContext {
+    inner: Rc<RefCell<Option<WgpuContext>>>,
+    #[cfg(not(target_family = "wasm"))]
+    initialization_failure: Rc<RefCell<Option<CachedHardwareRendererInitializationError>>>,
+}
 
 /// GPU resources that must be dropped together during device recovery.
 struct WgpuResources {
@@ -192,9 +202,29 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
-        let window_handle = window
-            .window_handle()
-            .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
+        Self::new_categorized(gpu_context, window, config, compositor_gpu)
+            .map_err(|error| error.error)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_categorized<W>(
+        gpu_context: GpuContext,
+        window: &W,
+        config: WgpuSurfaceConfig,
+        compositor_gpu: Option<CompositorGpuHint>,
+    ) -> std::result::Result<Self, HardwareRendererInitializationError>
+    where
+        W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
+    {
+        if let Some(error) = gpu_context.initialization_failure.borrow().as_ref() {
+            return Err(error.to_error());
+        }
+        let window_handle = window.window_handle().map_err(|error| {
+            HardwareRendererInitializationError::new(
+                RendererFallbackReason::SurfaceInitialization,
+                anyhow::anyhow!("Failed to get window handle: {error}"),
+            )
+        })?;
 
         let target = wgpu::SurfaceTargetUnsafe::RawHandle {
             // Fall back to the display handle already provided via InstanceDescriptor::display.
@@ -206,6 +236,7 @@ impl WgpuRenderer {
         // The surface must be created with the same instance that will be used for
         // adapter selection, otherwise wgpu will panic.
         let instance = gpu_context
+            .inner
             .borrow()
             .as_ref()
             .map(|ctx| ctx.instance.clone())
@@ -215,34 +246,68 @@ impl WgpuRenderer {
         // lifetime of this renderer. In practice, the RawWindow struct is created
         // from the native window handles and the surface is dropped before the window.
         let surface = unsafe {
-            instance
-                .create_surface_unsafe(target)
-                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
+            instance.create_surface_unsafe(target).map_err(|error| {
+                HardwareRendererInitializationError::new(
+                    RendererFallbackReason::SurfaceInitialization,
+                    anyhow::anyhow!("Failed to create surface: {error}"),
+                )
+            })?
         };
 
-        let mut ctx_ref = gpu_context.borrow_mut();
+        let mut ctx_ref = gpu_context.inner.borrow_mut();
         let context = match ctx_ref.as_mut() {
             Some(context) => {
-                context.check_compatible_with_surface(&surface)?;
+                context
+                    .check_compatible_with_surface(&surface)
+                    .map_err(|error| {
+                        HardwareRendererInitializationError::new(
+                            RendererFallbackReason::SurfaceInitialization,
+                            error,
+                        )
+                    })?;
                 context
             }
-            None => ctx_ref.insert(WgpuContext::new_rejecting_software(
-                instance,
-                &surface,
-                compositor_gpu,
-            )?),
+            None => {
+                let context = match WgpuContext::new_rejecting_software_categorized(
+                    instance,
+                    &surface,
+                    compositor_gpu,
+                ) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        if matches!(
+                            error.reason,
+                            RendererFallbackReason::NoHardwareAdapter
+                                | RendererFallbackReason::DeviceInitialization
+                        ) {
+                            gpu_context
+                                .initialization_failure
+                                .borrow_mut()
+                                .replace(CachedHardwareRendererInitializationError::new(&error));
+                        }
+                        return Err(error);
+                    }
+                };
+                ctx_ref.insert(context)
+            }
         };
 
         let atlas = Arc::new(WgpuAtlas::from_context(context));
 
         Self::new_internal(
-            Some(Rc::clone(&gpu_context)),
+            Some(gpu_context.clone()),
             context,
             surface,
             config,
             compositor_gpu,
             atlas,
         )
+        .map_err(|error| {
+            HardwareRendererInitializationError::new(
+                RendererFallbackReason::SurfaceInitialization,
+                error,
+            )
+        })
     }
 
     #[cfg(target_family = "wasm")]
@@ -1793,6 +1858,7 @@ impl WgpuRenderer {
 
         // Check if another window already recovered the context
         let needs_new_context = gpu_context
+            .inner
             .borrow()
             .as_ref()
             .is_none_or(|ctx| ctx.device_lost());
@@ -1806,7 +1872,8 @@ impl WgpuRenderer {
 
             // Drop old resources to release Arc<Device>/Arc<Queue> and GPU resources
             self.resources = None;
-            *gpu_context.borrow_mut() = None;
+            *gpu_context.inner.borrow_mut() = None;
+            gpu_context.initialization_failure.borrow_mut().take();
 
             // Wait briefly for the GPU driver to stabilize, then try to
             // recreate the context without software renderers. If this fails
@@ -1818,10 +1885,10 @@ impl WgpuRenderer {
             let surface = create_surface(&instance, window_handle.as_raw())?;
             let new_context =
                 WgpuContext::new_rejecting_software(instance, &surface, self.compositor_gpu)?;
-            *gpu_context.borrow_mut() = Some(new_context);
+            *gpu_context.inner.borrow_mut() = Some(new_context);
             surface
         } else {
-            let ctx_ref = gpu_context.borrow();
+            let ctx_ref = gpu_context.inner.borrow();
             let instance = &ctx_ref.as_ref().unwrap().instance;
             create_surface(instance, window_handle.as_raw())?
         };
@@ -1834,8 +1901,8 @@ impl WgpuRenderer {
             transparent: self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
             preferred_present_mode: Some(self.surface_config.present_mode),
         };
-        let gpu_context = Rc::clone(gpu_context);
-        let ctx_ref = gpu_context.borrow();
+        let gpu_context = gpu_context.clone();
+        let ctx_ref = gpu_context.inner.borrow();
         let context = ctx_ref.as_ref().expect("context should exist");
 
         self.resources = None;

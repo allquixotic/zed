@@ -15,7 +15,7 @@ use windows::Win32::{
         },
         Dxgi::{
             CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_DEBUG,
-            DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory6,
+            DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_NOT_FOUND, IDXGIAdapter1, IDXGIFactory6,
         },
     },
 };
@@ -45,11 +45,22 @@ pub(crate) struct DirectXDevices {
 
 impl DirectXDevices {
     pub(crate) fn new() -> Result<Self> {
+        Self::new_categorized().map_err(|error| error.error)
+    }
+
+    pub(crate) fn new_categorized()
+    -> std::result::Result<Self, gpui::HardwareRendererInitializationError> {
         let debug_layer_available = check_debug_layer_available();
-        let dxgi_factory =
-            get_dxgi_factory(debug_layer_available).context("Creating DXGI factory")?;
+        let dxgi_factory = get_dxgi_factory(debug_layer_available)
+            .context("Creating DXGI factory")
+            .map_err(|error| {
+                gpui::HardwareRendererInitializationError::new(
+                    gpui::RendererFallbackReason::DeviceInitialization,
+                    error,
+                )
+            })?;
         let (adapter, device, device_context, feature_level) =
-            get_adapter(&dxgi_factory, debug_layer_available).context("Getting DXGI adapter")?;
+            get_adapter(&dxgi_factory, debug_layer_available)?;
         match feature_level {
             D3D_FEATURE_LEVEL_11_1 => {
                 log::info!("Created device with Direct3D 11.1 feature level.")
@@ -106,14 +117,35 @@ fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
 fn get_adapter(
     dxgi_factory: &IDXGIFactory6,
     debug_layer_available: bool,
-) -> Result<(
-    IDXGIAdapter1,
-    ID3D11Device,
-    ID3D11DeviceContext,
-    D3D_FEATURE_LEVEL,
-)> {
-    for adapter_index in 0.. {
-        let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
+) -> std::result::Result<
+    (
+        IDXGIAdapter1,
+        ID3D11Device,
+        ID3D11DeviceContext,
+        D3D_FEATURE_LEVEL,
+    ),
+    gpui::HardwareRendererInitializationError,
+> {
+    let mut adapter_index = 0;
+    let mut hardware_adapter_found = false;
+    let mut last_device_error = None;
+    loop {
+        let adapter = match unsafe { dxgi_factory.EnumAdapters(adapter_index) } {
+            Ok(adapter) => adapter.cast::<IDXGIAdapter1>().map_err(|error| {
+                gpui::HardwareRendererInitializationError::new(
+                    gpui::RendererFallbackReason::DeviceInitialization,
+                    error,
+                )
+            })?,
+            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
+            Err(error) => {
+                return Err(gpui::HardwareRendererInitializationError::new(
+                    gpui::RendererFallbackReason::DeviceInitialization,
+                    error,
+                ));
+            }
+        };
+        adapter_index += 1;
         let Some(desc) = unsafe { adapter.GetDesc1() }
             .context("reading DXGI adapter description")
             .log_err()
@@ -127,29 +159,49 @@ fn get_adapter(
             log::info!("Ignoring software-emulated DirectX adapter: {gpu_name}");
             continue;
         }
+        hardware_adapter_found = true;
         log::info!("Using GPU: {}", gpu_name);
         // Check to see whether the adapter supports Direct3D 11 and create
         // the device if it does.
         let mut context: Option<ID3D11DeviceContext> = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();
-        if let Some(device) = get_device(
+        match get_device(
             &adapter,
             Some(&mut context),
             Some(&mut feature_level),
             debug_layer_available,
-        )
-        .log_err()
-        {
-            return Ok((
-                adapter,
-                device,
-                context.context("Direct3D did not return an immediate context")?,
-                feature_level,
-            ));
+        ) {
+            Ok(device) => {
+                let device_context = context
+                    .context("Direct3D did not return an immediate context")
+                    .map_err(|error| {
+                        gpui::HardwareRendererInitializationError::new(
+                            gpui::RendererFallbackReason::DeviceInitialization,
+                            error,
+                        )
+                    })?;
+                return Ok((adapter, device, device_context, feature_level));
+            }
+            Err(error) => {
+                log::warn!("Unable to initialize Direct3D device for {gpu_name}: {error:#}");
+                last_device_error = Some(error);
+            }
         }
     }
 
-    unreachable!()
+    if !hardware_adapter_found {
+        return Err(gpui::HardwareRendererInitializationError::new(
+            gpui::RendererFallbackReason::NoHardwareAdapter,
+            anyhow::anyhow!("No non-software DirectX adapter was found"),
+        ));
+    }
+
+    Err(gpui::HardwareRendererInitializationError::new(
+        gpui::RendererFallbackReason::DeviceInitialization,
+        last_device_error.unwrap_or_else(|| {
+            anyhow::anyhow!("No DirectX adapter could create a compatible Direct3D device")
+        }),
+    ))
 }
 
 #[inline]

@@ -2,17 +2,24 @@ use crate::metal_renderer;
 use anyhow::{Context as _, Result, ensure};
 use cocoa::base::{id, nil};
 use gpui::{
-    DevicePixels, HardwareAvailability, PlatformAtlas, RendererPreference, RenderingInfo, Rgba,
-    Scene, Size,
+    CachedHardwareRendererInitializationError, DevicePixels, HardwareRendererInitializationError,
+    PlatformAtlas, RendererFallbackReason, RendererPreference, RendererSelection, RenderingInfo,
+    Rgba, Scene, Size, select_renderer,
 };
 use gpui_software::{SoftwareAtlas, SoftwarePresenter, SoftwareRenderer};
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use objc::{msg_send, sel, sel_impl};
+use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::{ffi::c_void, ptr::NonNull, sync::Arc};
 
-pub(crate) type Context = metal_renderer::Context;
+#[derive(Clone, Default)]
+pub(crate) struct Context {
+    metal: metal_renderer::Context,
+    hardware_device: Arc<Mutex<Option<metal::Device>>>,
+    hardware_failure: Arc<Mutex<Option<CachedHardwareRendererInitializationError>>>,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AppKitWindow {
@@ -61,17 +68,55 @@ pub(crate) unsafe fn new_renderer(
     transparent: bool,
     preference: RendererPreference,
 ) -> Result<Renderer> {
-    match preference {
-        RendererPreference::Auto => {
-            let renderer = metal_renderer::MetalRenderer::new(context, transparent)
-                .context("creating Metal renderer")?;
-            let rendering_info = RenderingInfo::hardware(Some(renderer.gpu_specs()));
-            Ok(Renderer::Hardware {
-                renderer,
-                rendering_info,
-            })
-        }
-        RendererPreference::Software => {
+    let metal_context = context.metal;
+    let hardware_device = context.hardware_device;
+    let hardware_failure = context.hardware_failure;
+    let selection = select_renderer(
+        preference,
+        || {
+            if let Some(error) = hardware_failure.lock().as_ref() {
+                return Err(error.to_error());
+            }
+            let renderer = match (|| {
+                let device = if let Some(device) = hardware_device.lock().clone() {
+                    device
+                } else {
+                    let device =
+                        metal_renderer::MetalRenderer::create_device().map_err(|error| {
+                            HardwareRendererInitializationError::new(
+                                RendererFallbackReason::NoHardwareAdapter,
+                                error,
+                            )
+                        })?;
+                    hardware_device.lock().replace(device.clone());
+                    device
+                };
+                metal_renderer::MetalRenderer::new_with_device(device, metal_context, transparent)
+                    .map_err(|error| {
+                        HardwareRendererInitializationError::new(
+                            RendererFallbackReason::DeviceInitialization,
+                            error.context("creating Metal renderer"),
+                        )
+                    })
+            })() {
+                Ok(renderer) => renderer,
+                Err(error) => {
+                    if matches!(
+                        error.reason,
+                        RendererFallbackReason::NoHardwareAdapter
+                            | RendererFallbackReason::DeviceInitialization
+                    ) {
+                        hardware_failure
+                            .lock()
+                            .replace(CachedHardwareRendererInitializationError::new(&error));
+                    }
+                    return Err(error);
+                }
+            };
+            let gpu_specs = renderer.gpu_specs();
+            Ok((renderer, Some(gpu_specs)))
+        },
+        || {
             let view = NonNull::new(native_view).context("AppKit software view is null")?;
             let window = AppKitWindow { view };
             let presenter = SoftwarePresenter::new(window, window)
@@ -82,18 +127,29 @@ pub(crate) unsafe fn new_renderer(
                 "AppKit software view has no backing layer"
             );
             let atlas = Arc::new(SoftwareAtlas::new());
-            Ok(Renderer::Software {
-                renderer: SoftwareRenderer::new(atlas.clone()),
-                presenter: Some(presenter),
-                atlas,
-                backing_layer,
-                rendering_info: RenderingInfo::software(
-                    RendererPreference::Software,
-                    HardwareAvailability::NotProbed,
-                    None,
-                ),
-            })
-        }
+            let renderer = SoftwareRenderer::new(atlas.clone());
+            Ok((renderer, presenter, atlas, backing_layer))
+        },
+    )?;
+
+    match selection {
+        RendererSelection::Hardware {
+            renderer,
+            rendering_info,
+        } => Ok(Renderer::Hardware {
+            renderer,
+            rendering_info,
+        }),
+        RendererSelection::Software {
+            renderer: (renderer, presenter, atlas, backing_layer),
+            rendering_info,
+        } => Ok(Renderer::Software {
+            renderer,
+            presenter: Some(presenter),
+            atlas,
+            backing_layer,
+            rendering_info,
+        }),
     }
 }
 

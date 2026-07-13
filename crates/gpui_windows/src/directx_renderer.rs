@@ -131,34 +131,76 @@ impl DirectXRendererDevices {
 }
 
 impl DirectXRenderer {
-    pub(crate) fn new(
+    pub(crate) fn new_categorized(
         hwnd: HWND,
         directx_devices: &DirectXDevices,
         disable_direct_composition: bool,
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, gpui::HardwareRendererInitializationError> {
         if disable_direct_composition {
             log::info!("Direct Composition is disabled.");
         }
 
         let devices = DirectXRendererDevices::new(directx_devices, disable_direct_composition)
-            .context("Creating DirectX devices")?;
+            .context("Creating DirectX devices")
+            .map_err(|error| {
+                gpui::HardwareRendererInitializationError::new(
+                    gpui::RendererFallbackReason::DeviceInitialization,
+                    error,
+                )
+            })?;
         let atlas = Arc::new(DirectXAtlas::new(&devices.device, &devices.device_context));
 
         let resources = DirectXResources::new(&devices, 1, 1, hwnd, disable_direct_composition)
-            .context("Creating DirectX resources")?;
+            .context("Creating DirectX resources")
+            .map_err(|error| {
+                gpui::HardwareRendererInitializationError::new(
+                    gpui::RendererFallbackReason::SurfaceInitialization,
+                    error,
+                )
+            })?;
         let globals = DirectXGlobalElements::new(&devices.device)
-            .context("Creating DirectX global elements")?;
+            .context("Creating DirectX global elements")
+            .map_err(|error| {
+                gpui::HardwareRendererInitializationError::new(
+                    gpui::RendererFallbackReason::DeviceInitialization,
+                    error,
+                )
+            })?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
-            .context("Creating DirectX render pipelines")?;
+            .context("Creating DirectX render pipelines")
+            .map_err(|error| {
+                gpui::HardwareRendererInitializationError::new(
+                    gpui::RendererFallbackReason::DeviceInitialization,
+                    error,
+                )
+            })?;
 
         let direct_composition = if disable_direct_composition {
             None
         } else {
-            let composition = DirectComposition::new(devices.dxgi_device.as_ref().unwrap(), hwnd)
-                .context("Creating DirectComposition")?;
+            let dxgi_device = devices.dxgi_device.as_ref().ok_or_else(|| {
+                gpui::HardwareRendererInitializationError::new(
+                    gpui::RendererFallbackReason::DeviceInitialization,
+                    anyhow::anyhow!("DirectComposition requires a DXGI device"),
+                )
+            })?;
+            let composition = DirectComposition::new(dxgi_device, hwnd)
+                .context("Creating DirectComposition")
+                .map_err(|error| {
+                    gpui::HardwareRendererInitializationError::new(
+                        gpui::RendererFallbackReason::SurfaceInitialization,
+                        error,
+                    )
+                })?;
             composition
                 .set_swap_chain(&resources.swap_chain)
-                .context("Setting swap chain for DirectComposition")?;
+                .context("Setting swap chain for DirectComposition")
+                .map_err(|error| {
+                    gpui::HardwareRendererInitializationError::new(
+                        gpui::RendererFallbackReason::SurfaceInitialization,
+                        error,
+                    )
+                })?;
             Some(composition)
         };
 

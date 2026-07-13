@@ -5,6 +5,7 @@
 #![allow(unused_mut)] // False positives in platform specific code
 
 extern crate self as gpui;
+use anyhow::Context as _;
 #[doc(hidden)]
 pub static GPUI_MANIFEST_DIR: &'static str = env!("CARGO_MANIFEST_DIR");
 #[macro_use]
@@ -393,6 +394,123 @@ pub enum RendererFallbackReason {
     SurfaceInitialization,
 }
 
+/// A categorized failure while constructing a hardware renderer.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct HardwareRendererInitializationError {
+    /// The initialization stage that failed.
+    pub reason: RendererFallbackReason,
+    /// The complete platform-specific error chain.
+    pub error: anyhow::Error,
+}
+
+impl HardwareRendererInitializationError {
+    /// Creates a categorized hardware initialization failure.
+    pub fn new(reason: RendererFallbackReason, error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            reason,
+            error: error.into(),
+        }
+    }
+}
+
+/// A clonable hardware initialization failure for platform-level probe caches.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct CachedHardwareRendererInitializationError {
+    reason: RendererFallbackReason,
+    message: std::sync::Arc<str>,
+}
+
+impl CachedHardwareRendererInitializationError {
+    /// Captures a hardware initialization failure without losing its formatted chain.
+    pub fn new(error: &HardwareRendererInitializationError) -> Self {
+        Self {
+            reason: error.reason,
+            message: std::sync::Arc::from(format!("{:#}", error.error)),
+        }
+    }
+
+    /// Reconstructs the categorized failure for a subsequent window attempt.
+    pub fn to_error(&self) -> HardwareRendererInitializationError {
+        HardwareRendererInitializationError::new(self.reason, anyhow::anyhow!("{}", self.message))
+    }
+}
+
+/// The result of choosing between hardware and software renderer factories.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum RendererSelection<Hardware, Software> {
+    /// Hardware initialized successfully.
+    Hardware {
+        /// The initialized hardware renderer.
+        renderer: Hardware,
+        /// Renderer status reported to GPUI consumers.
+        rendering_info: RenderingInfo,
+    },
+    /// Software was requested or hardware initialization failed.
+    Software {
+        /// The initialized software renderer.
+        renderer: Software,
+        /// Renderer status reported to GPUI consumers.
+        rendering_info: RenderingInfo,
+    },
+}
+
+/// Chooses a renderer while preserving categorized hardware and software failure chains.
+#[doc(hidden)]
+pub fn select_renderer<Hardware, Software>(
+    preference: RendererPreference,
+    hardware_factory: impl FnOnce() -> std::result::Result<
+        (Hardware, Option<GpuSpecs>),
+        HardwareRendererInitializationError,
+    >,
+    software_factory: impl FnOnce() -> anyhow::Result<Software>,
+) -> anyhow::Result<RendererSelection<Hardware, Software>> {
+    if preference == RendererPreference::Software {
+        return software_factory()
+            .context("initializing requested software renderer")
+            .map(|renderer| RendererSelection::Software {
+                renderer,
+                rendering_info: RenderingInfo::software(
+                    RendererPreference::Software,
+                    HardwareAvailability::NotProbed,
+                    None,
+                ),
+            });
+    }
+
+    match hardware_factory() {
+        Ok((renderer, gpu_specs)) => Ok(RendererSelection::Hardware {
+            renderer,
+            rendering_info: RenderingInfo::hardware(gpu_specs),
+        }),
+        Err(hardware_error) => {
+            log::warn!(
+                "Hardware renderer initialization failed ({:?}); falling back to software: {:#}",
+                hardware_error.reason,
+                hardware_error.error
+            );
+            let fallback_reason = hardware_error.reason;
+            software_factory()
+                .with_context(|| {
+                    format!(
+                        "software renderer fallback failed after hardware initialization failed ({fallback_reason:?}): {:#}",
+                        hardware_error.error
+                    )
+                })
+                .map(|renderer| RendererSelection::Software {
+                    renderer,
+                    rendering_info: RenderingInfo::software(
+                        RendererPreference::Auto,
+                        HardwareAvailability::Unavailable,
+                        Some(fallback_reason),
+                    ),
+                })
+        }
+    }
+}
+
 /// Controls whether GPUI should run nonessential visual animations.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
@@ -520,9 +638,11 @@ pub struct GpuSpecs {
 #[cfg(test)]
 mod rendering_tests {
     use super::{
-        GpuSpecs, HardwareAvailability, PlatformOptions, RendererBackend, RendererFallbackReason,
-        RendererPreference, RenderingCapabilities, RenderingInfo,
+        GpuSpecs, HardwareAvailability, HardwareRendererInitializationError, PlatformOptions,
+        RendererBackend, RendererFallbackReason, RendererPreference, RendererSelection,
+        RenderingCapabilities, RenderingInfo, select_renderer,
     };
+    use std::cell::Cell;
 
     #[test]
     fn rendering_info_hardware_preserves_gpu_specs() {
@@ -564,5 +684,97 @@ mod rendering_tests {
     #[test]
     fn platform_options_default_to_automatic_hardware_selection() {
         assert_eq!(PlatformOptions::default(), PlatformOptions::auto(false));
+    }
+
+    #[test]
+    fn renderer_selector_covers_preference_and_fallback_matrix() {
+        let hardware_calls = Cell::new(0);
+        let software_calls = Cell::new(0);
+        let selection = select_renderer(
+            RendererPreference::Auto,
+            || {
+                hardware_calls.set(hardware_calls.get() + 1);
+                Ok(("hardware", Some(GpuSpecs::default())))
+            },
+            || {
+                software_calls.set(software_calls.get() + 1);
+                Ok("software")
+            },
+        )
+        .expect("hardware selection should succeed");
+        let RendererSelection::Hardware { rendering_info, .. } = selection else {
+            panic!("automatic selection should keep working hardware");
+        };
+        assert_eq!(hardware_calls.get(), 1);
+        assert_eq!(software_calls.get(), 0);
+        assert_eq!(
+            rendering_info.hardware_availability,
+            HardwareAvailability::Available
+        );
+
+        let selection = select_renderer(
+            RendererPreference::Auto,
+            || {
+                hardware_calls.set(hardware_calls.get() + 1);
+                Err::<(&str, Option<GpuSpecs>), _>(HardwareRendererInitializationError::new(
+                    RendererFallbackReason::SurfaceInitialization,
+                    anyhow::anyhow!("hardware surface failed"),
+                ))
+            },
+            || {
+                software_calls.set(software_calls.get() + 1);
+                Ok("software")
+            },
+        )
+        .expect("software fallback should succeed");
+        let RendererSelection::Software { rendering_info, .. } = selection else {
+            panic!("failed hardware should select software");
+        };
+        assert_eq!(hardware_calls.get(), 2);
+        assert_eq!(software_calls.get(), 1);
+        assert_eq!(
+            rendering_info.fallback_reason,
+            Some(RendererFallbackReason::SurfaceInitialization)
+        );
+
+        let selection = select_renderer(
+            RendererPreference::Software,
+            || {
+                hardware_calls.set(hardware_calls.get() + 1);
+                Ok(("hardware", None))
+            },
+            || {
+                software_calls.set(software_calls.get() + 1);
+                Ok("software")
+            },
+        )
+        .expect("requested software should succeed");
+        let RendererSelection::Software { rendering_info, .. } = selection else {
+            panic!("requested software should select software");
+        };
+        assert_eq!(hardware_calls.get(), 2);
+        assert_eq!(software_calls.get(), 2);
+        assert_eq!(
+            rendering_info.hardware_availability,
+            HardwareAvailability::NotProbed
+        );
+    }
+
+    #[test]
+    fn renderer_selector_combines_hardware_and_software_errors() {
+        let error = select_renderer::<(), ()>(
+            RendererPreference::Auto,
+            || {
+                Err(HardwareRendererInitializationError::new(
+                    RendererFallbackReason::DeviceInitialization,
+                    anyhow::anyhow!("hardware device failed"),
+                ))
+            },
+            || Err(anyhow::anyhow!("software presenter failed")),
+        )
+        .expect_err("both renderer factories should fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("hardware device failed"));
+        assert!(message.contains("software presenter failed"));
     }
 }

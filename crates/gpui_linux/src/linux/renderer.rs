@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use gpui::{
-    DevicePixels, HardwareAvailability, PlatformAtlas, RendererPreference, RenderingInfo, Rgba,
-    Scene, Size,
+    DevicePixels, HardwareRendererInitializationError, PlatformAtlas, RendererPreference,
+    RendererSelection, RenderingInfo, Rgba, Scene, Size, select_renderer,
 };
 use gpui_software::{SoftwareAtlas, SoftwarePresenter, SoftwareRenderer};
 use gpui_wgpu::{CompositorGpuHint, GpuContext, WgpuRenderer, WgpuSurfaceConfig};
@@ -32,32 +32,47 @@ where
         compositor_gpu: Option<CompositorGpuHint>,
         preference: RendererPreference,
     ) -> Result<Self> {
-        match preference {
-            RendererPreference::Auto => {
-                let renderer = WgpuRenderer::new(gpu_context, &window, config, compositor_gpu)
-                    .context("creating wgpu renderer")?;
-                let rendering_info = RenderingInfo::hardware(Some(renderer.gpu_specs()));
-                Ok(Self::Hardware {
-                    renderer,
-                    rendering_info,
-                })
-            }
-            RendererPreference::Software => {
+        let software_window = window.clone();
+        let selection = select_renderer(
+            preference,
+            || {
+                let renderer =
+                    WgpuRenderer::new_categorized(gpu_context, &window, config, compositor_gpu)
+                        .map_err(|error| {
+                            HardwareRendererInitializationError::new(
+                                error.reason,
+                                error.error.context("creating wgpu renderer"),
+                            )
+                        })?;
+                let gpu_specs = renderer.gpu_specs();
+                Ok((renderer, Some(gpu_specs)))
+            },
+            || {
                 let atlas = Arc::new(SoftwareAtlas::new());
                 let renderer = SoftwareRenderer::new(atlas.clone());
-                let presenter = SoftwarePresenter::new(window.clone(), window)
+                let presenter = SoftwarePresenter::new(software_window.clone(), software_window)
                     .context("creating Linux software presenter")?;
-                Ok(Self::Software {
-                    renderer,
-                    presenter: Some(presenter),
-                    atlas,
-                    rendering_info: RenderingInfo::software(
-                        RendererPreference::Software,
-                        HardwareAvailability::NotProbed,
-                        None,
-                    ),
-                })
-            }
+                Ok((renderer, presenter, atlas))
+            },
+        )?;
+
+        match selection {
+            RendererSelection::Hardware {
+                renderer,
+                rendering_info,
+            } => Ok(Self::Hardware {
+                renderer,
+                rendering_info,
+            }),
+            RendererSelection::Software {
+                renderer: (renderer, presenter, atlas),
+                rendering_info,
+            } => Ok(Self::Software {
+                renderer,
+                presenter: Some(presenter),
+                atlas,
+                rendering_info,
+            }),
         }
     }
 
