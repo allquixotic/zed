@@ -6,13 +6,13 @@
 //! This binary runs visual regression tests for Zed's UI. It captures screenshots
 //! of real Zed windows and compares them against baseline images.
 //!
-//! **Note: This tool is macOS-only** because it uses `VisualTestAppContext` which
-//! depends on the macOS Metal renderer for accurate screenshot capture.
+//! **Note: This tool is macOS-only** because its visual test context currently
+//! depends on the macOS window implementation for screenshot capture.
 //!
 //! ## How It Works
 //!
 //! This tool uses `VisualTestAppContext` which combines:
-//! - Real Metal/compositor rendering for accurate screenshots
+//! - Real GPUI window rendering for accurate hardware or software screenshots
 //! - Deterministic task scheduling via TestDispatcher
 //! - Controllable time via `advance_clock` for testing time-based behaviors
 //!
@@ -33,6 +33,8 @@
 //! ## Environment Variables
 //!
 //!   UPDATE_BASELINE - Set to update baseline images instead of comparing
+//!   ZED_VISUAL_TEST_RENDERER - Set to `software` to exercise the CPU renderer
+//!   VISUAL_TEST_BASELINE_DIR - Override the renderer-specific baseline directory
 //!   VISUAL_TEST_OUTPUT_DIR - Directory to save test output (default: target/visual_tests)
 
 // Stub main for non-macOS platforms
@@ -103,8 +105,9 @@ use {
     feature_flags::FeatureFlagAppExt as _,
     git_ui::project_diff::ProjectDiff,
     gpui::{
-        App, AppContext as _, Bounds, Entity, KeyBinding, Modifiers, VisualTestAppContext,
-        WindowBounds, WindowHandle, WindowOptions, point, px, size,
+        App, AppContext as _, Bounds, Entity, KeyBinding, Modifiers, PlatformOptions,
+        RendererBackend, RendererPreference, VisualTestAppContext, WindowBounds, WindowHandle,
+        WindowOptions, point, px, size,
     },
     image::RgbaImage,
     project::{AgentId, Project},
@@ -128,8 +131,8 @@ use {
 mod constants {
     use std::time::Duration;
 
-    /// Baseline images are stored relative to this file
-    pub const BASELINE_DIR: &str = "crates/zed/test_fixtures/visual_tests";
+    pub const HARDWARE_BASELINE_DIR: &str = "crates/zed/test_fixtures/visual_tests";
+    pub const SOFTWARE_BASELINE_DIR: &str = "crates/zed/test_fixtures/visual_tests_software";
 
     /// Embedded test image (Zed app icon) for visual tests.
     pub const EMBEDDED_TEST_IMAGE: &[u8] = include_bytes!("../resources/app-icon.png");
@@ -150,7 +153,10 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
     // Create the visual test context with deterministic task scheduling
     // Use real Assets so that SVG icons render properly
     let mut cx = VisualTestAppContext::with_asset_source(
-        gpui_platform::current_platform(false),
+        gpui_platform::current_platform_with_options(PlatformOptions {
+            headless: false,
+            renderer_preference: visual_test_renderer_preference(),
+        })?,
         Arc::new(Assets),
     );
 
@@ -290,6 +296,17 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         .context("Failed to open workspace window")?;
 
     cx.run_until_parked();
+
+    if visual_test_renderer_preference() == RendererPreference::Software {
+        let rendering_info = workspace_window
+            .update(&mut cx, |_, window, _| window.rendering_info())
+            .context("Failed to read visual test renderer status")?;
+        anyhow::ensure!(
+            rendering_info.active_backend == RendererBackend::Software,
+            "software visual test selected {:?}",
+            rendering_info.active_backend
+        );
+    }
 
     // Add the test project as a worktree
     let add_worktree_task = workspace_window
@@ -766,9 +783,25 @@ fn get_baseline_path(test_name: &str) -> PathBuf {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    workspace_root
-        .join(BASELINE_DIR)
-        .join(format!("{}.png", test_name))
+    let baseline_dir = std::env::var_os("VISUAL_TEST_BASELINE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            workspace_root.join(match visual_test_renderer_preference() {
+                RendererPreference::Auto => HARDWARE_BASELINE_DIR,
+                RendererPreference::Software => SOFTWARE_BASELINE_DIR,
+            })
+        });
+
+    baseline_dir.join(format!("{}.png", test_name))
+}
+
+#[cfg(target_os = "macos")]
+fn visual_test_renderer_preference() -> RendererPreference {
+    if std::env::var("ZED_VISUAL_TEST_RENDERER").as_deref() == Ok("software") {
+        RendererPreference::Software
+    } else {
+        RendererPreference::Auto
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1299,9 +1332,10 @@ fn run_breakpoint_hover_visual_tests(
 /// This test verifies that when opening settings via OpenSettingsAt with a path
 /// that maps to a single SubPageLink, the sub-page is automatically opened.
 ///
-/// This test captures two states:
+/// This test captures three states:
 /// 1. Settings opened with a path that maps to multiple items (no auto-open)
 /// 2. Settings opened with a path that maps to a single SubPageLink (auto-opens sub-page)
+/// 3. The rendering backend root-user setting and active renderer status
 #[cfg(target_os = "macos")]
 fn run_settings_ui_subpage_visual_tests(
     app_state: Arc<AppState>,
@@ -1443,6 +1477,41 @@ fn run_settings_ui_subpage_visual_tests(
     .log_err();
     cx.run_until_parked();
 
+    workspace_window
+        .update(cx, |_workspace, window, cx| {
+            window.dispatch_action(
+                Box::new(OpenSettingsAt {
+                    path: "rendering_backend".to_string(),
+                    target: None,
+                }),
+                cx,
+            );
+        })
+        .context("Failed to dispatch OpenSettingsAt for rendering backend")?;
+
+    cx.run_until_parked();
+
+    let settings_window_3 = cx
+        .update(|cx| {
+            cx.windows()
+                .into_iter()
+                .find_map(|window| window.downcast::<SettingsWindow>())
+        })
+        .context("Settings window not found for rendering backend test")?;
+
+    let test3_result = run_visual_test(
+        "settings_ui_rendering_backend",
+        settings_window_3.into(),
+        cx,
+        update_baseline,
+    )?;
+
+    cx.update_window(settings_window_3.into(), |_, window, _cx| {
+        window.remove_window();
+    })
+    .log_err();
+    cx.run_until_parked();
+
     // Clean up: close the workspace window
     cx.update_window(workspace_window.into(), |_, window, _cx| {
         window.remove_window();
@@ -1457,10 +1526,12 @@ fn run_settings_ui_subpage_visual_tests(
     }
 
     // Return combined result
-    match (&test1_result, &test2_result) {
-        (TestResult::Passed, TestResult::Passed) => Ok(TestResult::Passed),
-        (TestResult::BaselineUpdated(p), _) | (_, TestResult::BaselineUpdated(p)) => {
-            Ok(TestResult::BaselineUpdated(p.clone()))
+    match (&test1_result, &test2_result, &test3_result) {
+        (TestResult::Passed, TestResult::Passed, TestResult::Passed) => Ok(TestResult::Passed),
+        (TestResult::BaselineUpdated(path), _, _)
+        | (_, TestResult::BaselineUpdated(path), _)
+        | (_, _, TestResult::BaselineUpdated(path)) => {
+            Ok(TestResult::BaselineUpdated(path.clone()))
         }
     }
 }
