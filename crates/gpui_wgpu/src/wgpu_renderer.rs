@@ -13,8 +13,10 @@ use gpui::{
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+#[cfg(not(target_family = "wasm"))]
 use std::cell::RefCell;
 use std::num::NonZeroU64;
+#[cfg(not(target_family = "wasm"))]
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -109,6 +111,7 @@ struct WgpuBindGroupLayouts {
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
 #[derive(Clone, Default)]
 pub struct GpuContext {
+    #[cfg(not(target_family = "wasm"))]
     inner: Rc<RefCell<Option<WgpuContext>>>,
     #[cfg(not(target_family = "wasm"))]
     initialization_failure: Rc<RefCell<Option<CachedHardwareRendererInitializationError>>>,

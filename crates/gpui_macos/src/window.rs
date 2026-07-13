@@ -898,6 +898,7 @@ impl MacWindow {
                     return Err(error);
                 }
             };
+            let is_software_renderer = renderer.is_software();
 
             let mut window = Self(Arc::new(Mutex::new(MacWindowState {
                 handle,
@@ -926,7 +927,7 @@ impl MacWindow {
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
                 traffic_light_frames: None,
-                transparent_titlebar: renderer_preference != RendererPreference::Software
+                transparent_titlebar: !is_software_renderer
                     && titlebar
                         .as_ref()
                         .is_none_or(|titlebar| titlebar.appears_transparent),
@@ -974,15 +975,16 @@ impl MacWindow {
                 });
             }
 
-            if renderer_preference != RendererPreference::Software
-                && titlebar.is_none_or(|titlebar| titlebar.appears_transparent)
+            if !is_software_renderer && titlebar.is_none_or(|titlebar| titlebar.appears_transparent)
             {
                 native_window.setTitlebarAppearsTransparent_(YES);
                 native_window.setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleHidden);
             }
 
             native_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
-            native_view.setWantsBestResolutionOpenGLSurface_(YES);
+            if !is_software_renderer {
+                native_view.setWantsBestResolutionOpenGLSurface_(YES);
+            }
 
             // From winit crate: On Mojave, views automatically become layer-backed shortly after
             // being added to a native_window. Changing the layer-backedness of a view breaks the
