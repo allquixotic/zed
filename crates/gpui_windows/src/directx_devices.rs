@@ -14,8 +14,8 @@ use windows::Win32::{
             D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
         },
         Dxgi::{
-            CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIFactory6,
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_DEBUG,
+            DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory6,
         },
     },
 };
@@ -31,7 +31,7 @@ pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T
             f()
         })
         .find_or_last(Result::is_ok)
-        .unwrap()
+        .context("DirectX recovery did not run any attempts")?
         .context("DirectXRenderer failed to recover from lost device after multiple attempts")
 }
 
@@ -60,7 +60,7 @@ impl DirectXDevices {
             D3D_FEATURE_LEVEL_10_1 => {
                 log::info!("Created device with Direct3D 10.1 feature level.")
             }
-            _ => unreachable!(),
+            feature_level => log::info!("Created device with feature level {feature_level:?}."),
         }
 
         Ok(Self {
@@ -114,12 +114,20 @@ fn get_adapter(
 )> {
     for adapter_index in 0.. {
         let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
-        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
-            let gpu_name = String::from_utf16_lossy(&desc.Description)
-                .trim_matches(char::from(0))
-                .to_string();
-            log::info!("Using GPU: {}", gpu_name);
+        let Some(desc) = unsafe { adapter.GetDesc1() }
+            .context("reading DXGI adapter description")
+            .log_err()
+        else {
+            continue;
+        };
+        let gpu_name = String::from_utf16_lossy(&desc.Description)
+            .trim_matches(char::from(0))
+            .to_string();
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+            log::info!("Ignoring software-emulated DirectX adapter: {gpu_name}");
+            continue;
         }
+        log::info!("Using GPU: {}", gpu_name);
         // Check to see whether the adapter supports Direct3D 11 and create
         // the device if it does.
         let mut context: Option<ID3D11DeviceContext> = None;
@@ -132,7 +140,12 @@ fn get_adapter(
         )
         .log_err()
         {
-            return Ok((adapter, device, context.unwrap(), feature_level));
+            return Ok((
+                adapter,
+                device,
+                context.context("Direct3D did not return an immediate context")?,
+                feature_level,
+            ));
         }
     }
 
@@ -170,7 +183,7 @@ fn get_device(
             context,
         )?;
     }
-    let device = device.unwrap();
+    let device = device.context("Direct3D did not return a device")?;
     let mut data = D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS::default();
     unsafe {
         device

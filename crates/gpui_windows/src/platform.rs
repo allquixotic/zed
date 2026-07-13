@@ -46,6 +46,7 @@ pub struct WindowsPlatform {
     handle: HWND,
     suspend_resume_notification: RefCell<Option<HPOWERNOTIFY>>,
     disable_direct_composition: bool,
+    renderer_preference: RendererPreference,
 }
 
 struct WindowsPlatformInner {
@@ -66,6 +67,7 @@ pub(crate) struct WindowsPlatformState {
     /// Shared with each window so `WM_SETCURSOR` can read it directly.
     pub(crate) cursor_visible: Arc<AtomicBool>,
     directx_devices: RefCell<Option<DirectXDevices>>,
+    directx_initialization_error: RefCell<Option<Arc<str>>>,
 }
 
 #[derive(Default)]
@@ -81,7 +83,7 @@ struct PlatformCallbacks {
 }
 
 impl WindowsPlatformState {
-    fn new(directx_devices: Option<DirectXDevices>) -> Self {
+    fn new() -> Self {
         let callbacks = PlatformCallbacks::default();
         let jump_list = JumpList::new();
         let current_cursor = load_cursor(CursorStyle::Arrow);
@@ -91,31 +93,49 @@ impl WindowsPlatformState {
             jump_list: RefCell::new(jump_list),
             current_cursor: Cell::new(current_cursor),
             cursor_visible: Arc::new(AtomicBool::new(true)),
-            directx_devices: RefCell::new(directx_devices),
+            directx_devices: RefCell::new(None),
+            directx_initialization_error: RefCell::new(None),
             menus: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn directx_devices(&self) -> Result<DirectXDevices> {
+        if let Some(devices) = self.directx_devices.borrow().clone() {
+            return Ok(devices);
+        }
+        if let Some(error) = self.directx_initialization_error.borrow().clone() {
+            anyhow::bail!("DirectX device initialization previously failed: {error}");
+        }
+        match DirectXDevices::new().context("creating DirectX devices") {
+            Ok(devices) => {
+                *self.directx_devices.borrow_mut() = Some(devices.clone());
+                Ok(devices)
+            }
+            Err(error) => {
+                *self.directx_initialization_error.borrow_mut() =
+                    Some(Arc::from(format!("{error:#}")));
+                Err(error)
+            }
         }
     }
 }
 
 impl WindowsPlatform {
     pub fn new(headless: bool) -> Result<Self> {
+        Self::new_with_options(PlatformOptions::auto(headless))
+    }
+
+    pub fn new_with_options(options: PlatformOptions) -> Result<Self> {
         unsafe {
             OleInitialize(None).context("unable to initialize Windows OLE")?;
         }
-        let (directx_devices, text_system) = if !headless {
-            let devices = DirectXDevices::new().context("Creating DirectX devices")?;
+        let text_system = if !options.headless {
             let dw_text_system = Arc::new(
                 DirectWriteTextSystem::new().context("Error creating DirectWriteTextSystem")?,
             );
-            (
-                Some(devices),
-                dw_text_system.clone() as Arc<dyn PlatformTextSystem>,
-            )
+            dw_text_system as Arc<dyn PlatformTextSystem>
         } else {
-            (
-                None,
-                Arc::new(gpui::NoopTextSystem::new()) as Arc<dyn PlatformTextSystem>,
-            )
+            Arc::new(gpui::NoopTextSystem::new()) as Arc<dyn PlatformTextSystem>
         };
 
         let (main_sender, main_receiver) = PriorityQueueReceiver::new();
@@ -133,7 +153,6 @@ impl WindowsPlatform {
             validation_number,
             main_sender: Some(main_sender),
             main_receiver: Some(main_receiver),
-            directx_devices,
             dispatcher: None,
         };
         let result = unsafe {
@@ -167,7 +186,7 @@ impl WindowsPlatform {
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher);
 
-        let drop_target_helper: Option<IDropTargetHelper> = if !headless {
+        let drop_target_helper: Option<IDropTargetHelper> = if !options.headless {
             Some(unsafe {
                 CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER)
                     .context("Error creating drop target helper.")?
@@ -175,7 +194,7 @@ impl WindowsPlatform {
         } else {
             None
         };
-        let icon = if !headless {
+        let icon = if !options.headless {
             load_icon().unwrap_or_default()
         } else {
             HICON::default()
@@ -185,13 +204,14 @@ impl WindowsPlatform {
             inner,
             handle,
             raw_window_handles,
-            headless,
+            headless: options.headless,
             icon,
             background_executor,
             foreground_executor,
             text_system,
             suspend_resume_notification: RefCell::new(None),
             disable_direct_composition,
+            renderer_preference: options.renderer_preference,
             drop_target_helper,
             invalidate_devices: Arc::new(AtomicBool::new(false)),
         })
@@ -215,20 +235,33 @@ impl WindowsPlatform {
             });
     }
 
-    fn generate_creation_info(&self) -> WindowCreationInfo {
-        WindowCreationInfo {
+    fn generate_creation_info(&self) -> Result<WindowCreationInfo> {
+        let renderer = match self.renderer_preference {
+            RendererPreference::Auto => WindowsRendererConfig::Hardware(
+                self.inner
+                    .state
+                    .directx_devices()
+                    .context("initializing hardware renderer")?,
+            ),
+            RendererPreference::Software => WindowsRendererConfig::Software,
+        };
+        Ok(WindowCreationInfo {
             icon: self.icon,
             executor: self.foreground_executor.clone(),
             current_cursor: self.inner.state.current_cursor.get(),
             cursor_visible: self.inner.state.cursor_visible.clone(),
-            drop_target_helper: self.drop_target_helper.clone().unwrap(),
+            drop_target_helper: self
+                .drop_target_helper
+                .clone()
+                .context("window creation is unavailable on a headless platform")?,
             validation_number: self.inner.validation_number,
             main_receiver: self.inner.main_receiver.clone(),
             platform_window_handle: self.handle,
-            disable_direct_composition: self.disable_direct_composition,
-            directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
+            disable_direct_composition: self.disable_direct_composition
+                || self.renderer_preference == RendererPreference::Software,
+            renderer,
             invalidate_devices: self.invalidate_devices.clone(),
-        }
+        })
     }
 
     fn set_dock_menus(&self, menus: Vec<MenuItem>) {
@@ -293,31 +326,29 @@ impl WindowsPlatform {
     }
 
     fn begin_vsync_thread(&self) {
-        let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
-            return;
-        };
-        let mut directx_device = directx_devices;
+        let mut directx_device = self.inner.state.directx_devices.borrow().clone();
         let platform_window: SafeHwnd = self.handle.into();
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
         let invalidate_devices = self.invalidate_devices.clone();
 
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
                 loop {
                     vsync_provider.wait_for_vsync();
-                    if check_device_lost(&directx_device.device)
-                        || invalidate_devices.fetch_and(false, Ordering::Acquire)
+                    if let Some(directx_device) = directx_device.as_mut()
+                        && (check_device_lost(&directx_device.device)
+                            || invalidate_devices.fetch_and(false, Ordering::Acquire))
                     {
-                        if let Err(err) = handle_gpu_device_lost(
-                            &mut directx_device,
+                        if let Err(error) = handle_gpu_device_lost(
+                            directx_device,
                             platform_window.as_raw(),
                             validation_number,
                             &all_windows,
                         ) {
-                            panic!("Device lost: {err}");
+                            log::error!("failed to recover lost DirectX device: {error:#}");
                         }
                     }
                     let Some(all_windows) = all_windows.upgrade() else {
@@ -325,12 +356,21 @@ impl WindowsPlatform {
                     };
                     for hwnd in all_windows.read().iter() {
                         unsafe {
-                            let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                            if !RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE)
+                                .as_bool()
+                            {
+                                log::error!(
+                                    "failed to invalidate Win32 window: {}",
+                                    std::io::Error::last_os_error()
+                                );
+                            }
                         }
                     }
                 }
-            })
-            .unwrap();
+            });
+        if let Err(error) = spawn_result {
+            log::error!("failed to start VSyncProvider thread: {error}");
+        }
     }
 }
 
@@ -518,7 +558,7 @@ impl Platform for WindowsPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
+        let window = WindowsWindow::new(handle, options, self.generate_creation_info()?)?;
         let handle = window.get_raw_handle();
         self.raw_window_handles.write().push(handle.into());
 
@@ -856,7 +896,7 @@ impl Platform for WindowsPlatform {
 
 impl WindowsPlatformInner {
     fn new(context: &mut PlatformWindowCreateContext) -> Result<Rc<Self>> {
-        let state = WindowsPlatformState::new(context.directx_devices.take());
+        let state = WindowsPlatformState::new();
         Ok(Rc::new(Self {
             state,
             raw_window_handles: context.raw_window_handles.clone(),
@@ -1048,6 +1088,7 @@ impl WindowsPlatformInner {
         let directx_devices = unsafe { &*directx_devices };
         self.state.directx_devices.borrow_mut().take();
         *self.state.directx_devices.borrow_mut() = Some(directx_devices.clone());
+        self.state.directx_initialization_error.borrow_mut().take();
 
         Some(0)
     }
@@ -1078,7 +1119,7 @@ pub(crate) struct WindowCreationInfo {
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) disable_direct_composition: bool,
-    pub(crate) directx_devices: DirectXDevices,
+    pub(crate) renderer: WindowsRendererConfig,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     pub(crate) invalidate_devices: Arc<AtomicBool>,
@@ -1090,7 +1131,6 @@ struct PlatformWindowCreateContext {
     validation_number: usize,
     main_sender: Option<PriorityQueueSender<RunnableVariant>>,
     main_receiver: Option<PriorityQueueReceiver<RunnableVariant>>,
-    directx_devices: Option<DirectXDevices>,
     dispatcher: Option<Arc<WindowsDispatcher>>,
 }
 

@@ -1,5 +1,6 @@
-use std::ops::Deref;
+use std::{num::NonZeroIsize, ops::Deref};
 
+use raw_window_handle as rwh;
 use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::HCURSOR};
 
 #[derive(Debug, Clone, Copy)]
@@ -49,5 +50,20 @@ impl Deref for SafeHwnd {
 
     fn deref(&self) -> &Self::Target {
         &self.raw
+    }
+}
+
+impl rwh::HasWindowHandle for SafeHwnd {
+    fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
+        let hwnd = NonZeroIsize::new(self.raw.0 as isize).ok_or(rwh::HandleError::Unavailable)?;
+        let raw = rwh::Win32WindowHandle::new(hwnd).into();
+        // Callers retain the native window for the returned borrow; software presentation releases it before DestroyWindow.
+        Ok(unsafe { rwh::WindowHandle::borrow_raw(raw) })
+    }
+}
+
+impl rwh::HasDisplayHandle for SafeHwnd {
+    fn display_handle(&self) -> Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
+        Ok(rwh::DisplayHandle::windows())
     }
 }

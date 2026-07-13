@@ -62,7 +62,7 @@ pub struct WindowsWindowState {
     pub hovered: Cell<bool>,
     pub direct_manipulation: DirectManipulationHandler,
 
-    pub renderer: RefCell<DirectXRenderer>,
+    pub renderer: RefCell<WindowsRenderer>,
     /// Set after a GPU device-lost recovery so the next `draw_window` call is
     /// treated as a forced render. This guarantees the next frame both
     /// re-enables drawing (via `mark_drawable`) and bypasses the GPUI view
@@ -106,7 +106,7 @@ pub(crate) struct WindowsWindowInner {
 impl WindowsWindowState {
     fn new(
         hwnd: HWND,
-        directx_devices: &DirectXDevices,
+        renderer: WindowsRendererConfig,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
         cursor_visible: Arc<AtomicBool>,
@@ -134,8 +134,8 @@ impl WindowsWindowState {
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
-            .context("Creating DirectX renderer")?;
+        let renderer = WindowsRenderer::new(hwnd, renderer, disable_direct_composition)
+            .context("creating window renderer")?;
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
@@ -246,7 +246,7 @@ impl WindowsWindowInner {
     fn new(context: &mut WindowCreateContext, hwnd: HWND, cs: &CREATESTRUCTW) -> Result<Rc<Self>> {
         let state = WindowsWindowState::new(
             hwnd,
-            &context.directx_devices,
+            context.renderer.clone(),
             cs,
             context.current_cursor,
             context.cursor_visible.clone(),
@@ -400,7 +400,7 @@ struct WindowCreateContext {
     platform_window_handle: HWND,
     appearance: WindowAppearance,
     disable_direct_composition: bool,
-    directx_devices: DirectXDevices,
+    renderer: WindowsRendererConfig,
     invalidate_devices: Arc<AtomicBool>,
     parent_hwnd: Option<HWND>,
 }
@@ -427,7 +427,7 @@ impl WindowsWindow {
             main_receiver,
             platform_window_handle,
             disable_direct_composition,
-            directx_devices,
+            renderer,
             invalidate_devices,
         } = creation_info;
         register_window_class(icon);
@@ -511,7 +511,7 @@ impl WindowsWindow {
             platform_window_handle,
             appearance,
             disable_direct_composition,
-            directx_devices,
+            renderer,
             invalidate_devices,
             parent_hwnd,
         };
@@ -586,6 +586,7 @@ impl Drop for WindowsWindow {
             .executor
             .spawn(async move {
                 let handle = this.hwnd;
+                this.state.renderer.borrow_mut().prepare_window_destroy();
                 unsafe {
                     RevokeDragDrop(handle).log_err();
                     DestroyWindow(handle).log_err();
@@ -864,6 +865,11 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
+        let background_appearance = if self.state.renderer.borrow().is_software() {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            background_appearance
+        };
         self.state.background_appearance.set(background_appearance);
         let hwnd = self.0.hwnd;
 
@@ -975,10 +981,17 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn draw(&self, scene: &Scene) {
+        let scale_factor = self.state.scale_factor.get();
+        let size = self.state.logical_size.get().to_device_pixels(scale_factor);
         self.state
             .renderer
             .borrow_mut()
-            .draw(scene, self.state.background_appearance.get())
+            .draw(
+                scene,
+                self.state.background_appearance.get(),
+                size,
+                scale_factor,
+            )
             .log_err();
     }
 
@@ -990,8 +1003,12 @@ impl PlatformWindow for WindowsWindow {
         self.0.hwnd
     }
 
+    fn rendering_info(&self) -> RenderingInfo {
+        self.state.renderer.borrow().rendering_info()
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        self.state.renderer.borrow().gpu_specs().log_err()
+        self.rendering_info().gpu_specs
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {
