@@ -443,6 +443,9 @@ pub struct UserSettingsContent {
     #[serde(flatten)]
     pub content: Box<SettingsContent>,
 
+    /// Selects the renderer before the GPUI platform is initialized.
+    pub rendering_backend: Option<gpui::RendererPreference>,
+
     #[serde(flatten)]
     pub release_channel_overrides: ReleaseChannelOverrides,
 

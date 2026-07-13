@@ -10,9 +10,10 @@ use futures::{StreamExt, channel::mpsc};
 use fuzzy::StringMatchCandidate;
 use gpui::{
     Action, App, AsyncApp, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, Div, Entity, FocusHandle,
-    Focusable, Global, KeyContext, ListState, ReadGlobal as _, Role, ScrollHandle, Stateful,
-    Subscription, Task, Tiling, TitlebarOptions, UniformListScrollHandle, WeakEntity, Window,
-    WindowBounds, WindowHandle, WindowOptions, actions, div, list, point, prelude::*, px,
+    Focusable, Global, HardwareAvailability, KeyContext, ListState, ReadGlobal as _,
+    RendererBackend, RendererFallbackReason, RendererPreference, RenderingInfo, Role, ScrollHandle,
+    Stateful, Subscription, Task, Tiling, TitlebarOptions, UniformListScrollHandle, WeakEntity,
+    Window, WindowBounds, WindowHandle, WindowOptions, actions, div, list, point, prelude::*, px,
     uniform_list,
 };
 
@@ -36,6 +37,7 @@ use std::{
     sync::{Arc, LazyLock, RwLock},
     time::Duration,
 };
+use strum::VariantArray as _;
 use theme_settings::ThemeSettings;
 use ui::{
     Banner, ContextMenu, Divider, DropdownMenu, DropdownStyle, IconButtonShape, KeyBinding,
@@ -1058,6 +1060,7 @@ struct SettingsPage {
 enum SettingsPageItem {
     SectionHeader(&'static str),
     SettingItem(SettingItem),
+    RenderingBackend,
     SubPageLink(SubPageLink),
     DynamicItem(DynamicItem),
     ActionLink(ActionLink),
@@ -1070,6 +1073,7 @@ impl std::fmt::Debug for SettingsPageItem {
             SettingsPageItem::SettingItem(setting_item) => {
                 write!(f, "SettingItem({})", setting_item.title)
             }
+            SettingsPageItem::RenderingBackend => write!(f, "RenderingBackend"),
             SettingsPageItem::SubPageLink(sub_page_link) => {
                 write!(f, "SubPageLink({})", sub_page_link.title)
             }
@@ -1184,6 +1188,14 @@ impl SettingsPageItem {
                     .when(bottom_border, |this| this.child(Divider::horizontal()))
                     .into_any_element()
             }
+            SettingsPageItem::RenderingBackend => v_flex()
+                .group("setting-item")
+                .px_8()
+                .child(
+                    render_rendering_backend_item(settings_window, window, cx).map(apply_padding),
+                )
+                .when(bottom_border, |this| this.child(Divider::horizontal()))
+                .into_any_element(),
             SettingsPageItem::SubPageLink(sub_page_link) => v_flex()
                 .group("setting-item")
                 .px_8()
@@ -1445,6 +1457,137 @@ fn render_settings_item_layout(
                 cx,
             ))
         })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RenderingBackendControlState {
+    stored_preference: RendererPreference,
+    selector_disabled: bool,
+    restart_required: bool,
+    status: String,
+}
+
+fn rendering_backend_control_state(
+    stored_preference: RendererPreference,
+    rendering_info: &RenderingInfo,
+) -> RenderingBackendControlState {
+    let selector_disabled = rendering_info.requested_preference == RendererPreference::Auto
+        && rendering_info.hardware_availability == HardwareAvailability::Unavailable;
+    let status = match rendering_info.active_backend {
+        RendererBackend::Hardware => rendering_info
+            .gpu_specs
+            .as_ref()
+            .filter(|gpu_specs| !gpu_specs.device_name.is_empty())
+            .map(|gpu_specs| format!("Hardware rendering is active: {}.", gpu_specs.device_name))
+            .unwrap_or_else(|| "Hardware rendering is active.".to_string()),
+        RendererBackend::Software
+            if rendering_info.hardware_availability == HardwareAvailability::NotProbed =>
+        {
+            "Software rendering is active. GPU availability was not checked.".to_string()
+        }
+        RendererBackend::Software => {
+            let mut status =
+                "Software rendering is active because no compatible GPU was found.".to_string();
+            match rendering_info.fallback_reason {
+                Some(RendererFallbackReason::DeviceInitialization) => {
+                    status.push_str(" GPU device initialization failed.");
+                }
+                Some(RendererFallbackReason::SurfaceInitialization) => {
+                    status.push_str(" GPU surface initialization failed.");
+                }
+                Some(RendererFallbackReason::NoHardwareAdapter) | None => {}
+            }
+            status
+        }
+    };
+
+    RenderingBackendControlState {
+        stored_preference,
+        selector_disabled,
+        restart_required: stored_preference != rendering_info.requested_preference,
+        status,
+    }
+}
+
+fn render_rendering_backend_item(
+    settings_window: &SettingsWindow,
+    window: &mut Window,
+    cx: &mut Context<'_, SettingsWindow>,
+) -> Stateful<Div> {
+    const LABELS: &[&str] = &["Automatic (GPU when available)", "Software (CPU)"];
+
+    let stored_preference = SettingsStore::global(cx)
+        .raw_user_settings()
+        .and_then(|settings| settings.rendering_backend)
+        .unwrap_or_default();
+    let state = rendering_backend_control_state(stored_preference, &window.rendering_info());
+    let control = v_flex()
+        .items_end()
+        .gap_2()
+        .max_w_1_2()
+        .child(
+            EnumVariantDropdown::new(
+                "rendering-backend-dropdown",
+                state.stored_preference,
+                RendererPreference::VARIANTS,
+                LABELS,
+                move |preference, _, cx| {
+                    telemetry::event!(
+                        "Settings Change",
+                        setting = "rendering_backend",
+                        type = "User"
+                    );
+                    settings::update_root_user_settings_file(
+                        <dyn fs::Fs>::global(cx),
+                        cx,
+                        move |settings, _| {
+                            settings.rendering_backend = Some(preference);
+                        },
+                    );
+                },
+            )
+            .aria_label("Rendering Backend")
+            .disabled(state.selector_disabled)
+            .tab_index(0)
+            .title_case(false),
+        )
+        .child(
+            Label::new(state.status)
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+        .when(state.restart_required, |this| {
+            this.child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Label::new("Restart required")
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                    )
+                    .child(
+                        Button::new("restart-after-rendering-backend-change", "Restart Zed")
+                            .aria_label("Restart Zed to apply the rendering backend")
+                            .style(ButtonStyle::Outlined)
+                            .size(ButtonSize::Medium)
+                            .tab_index(0_isize)
+                            .on_click(|_, _, cx| workspace::reload(cx)),
+                    ),
+            )
+        })
+        .into_any_element();
+
+    render_settings_item_layout(
+        settings_window,
+        "Rendering Backend",
+        "Choose automatic GPU rendering or CPU software rendering.",
+        control,
+        None,
+        None,
+        Some("rendering_backend"),
+        false,
+        cx,
+    )
 }
 
 fn render_settings_item(
@@ -2200,6 +2343,13 @@ impl SettingsWindow {
                             any_found_since_last_header = true;
                         }
                     }
+                    SettingsPageItem::RenderingBackend => {
+                        if !USER.contains(current_file) {
+                            page_filter[index] = false;
+                        } else {
+                            any_found_since_last_header = true;
+                        }
+                    }
                     SettingsPageItem::ActionLink(ActionLink { files, .. }) => {
                         if !files.contains(current_file) {
                             page_filter[index] = false;
@@ -2414,6 +2564,28 @@ impl SettingsWindow {
                         });
                         push_candidates(&mut fuzzy_match_candidates, key_index, item.title);
                         push_candidates(&mut fuzzy_match_candidates, key_index, item.description);
+                    }
+                    SettingsPageItem::RenderingBackend => {
+                        json_path = Some("rendering_backend");
+                        documents.push(SearchDocument {
+                            id: key_index,
+                            words: split_into_words(&[
+                                page.title,
+                                header_str,
+                                "Rendering Backend",
+                                "Choose automatic GPU rendering or CPU software rendering.",
+                            ]),
+                        });
+                        push_candidates(
+                            &mut fuzzy_match_candidates,
+                            key_index,
+                            "Rendering Backend",
+                        );
+                        push_candidates(
+                            &mut fuzzy_match_candidates,
+                            key_index,
+                            "GPU CPU software automatic",
+                        );
                     }
                     SettingsPageItem::SectionHeader(header) => {
                         documents.push(SearchDocument {
@@ -4374,6 +4546,7 @@ impl SettingsWindow {
                     SettingsPageItem::DynamicItem(dynamic_item) => {
                         dynamic_item.discriminant.field.json_path()
                     }
+                    SettingsPageItem::RenderingBackend => Some("rendering_backend"),
                     _ => None,
                 };
                 if item_json_path == Some(json_path) {
@@ -5254,6 +5427,55 @@ fn render_icon_theme_picker(
 pub mod test {
 
     use super::*;
+
+    #[test]
+    fn rendering_backend_control_reports_hardware_and_restart_state() {
+        let rendering_info = RenderingInfo::hardware(Some(gpui::GpuSpecs {
+            device_name: "Example GPU".to_string(),
+            ..Default::default()
+        }));
+
+        let active = rendering_backend_control_state(RendererPreference::Auto, &rendering_info);
+        assert!(!active.selector_disabled);
+        assert!(!active.restart_required);
+        assert_eq!(active.status, "Hardware rendering is active: Example GPU.");
+
+        let pending =
+            rendering_backend_control_state(RendererPreference::Software, &rendering_info);
+        assert!(pending.restart_required);
+        assert!(!pending.selector_disabled);
+    }
+
+    #[test]
+    fn rendering_backend_control_reports_software_selection_states() {
+        let automatic_fallback = RenderingInfo::software(
+            RendererPreference::Auto,
+            HardwareAvailability::Unavailable,
+            Some(RendererFallbackReason::DeviceInitialization),
+        );
+        let automatic =
+            rendering_backend_control_state(RendererPreference::Auto, &automatic_fallback);
+        assert!(automatic.selector_disabled);
+        assert!(!automatic.restart_required);
+        assert_eq!(
+            automatic.status,
+            "Software rendering is active because no compatible GPU was found. GPU device initialization failed."
+        );
+
+        let forced_software = RenderingInfo::software(
+            RendererPreference::Software,
+            HardwareAvailability::NotProbed,
+            None,
+        );
+        let forced =
+            rendering_backend_control_state(RendererPreference::Software, &forced_software);
+        assert!(!forced.selector_disabled);
+        assert!(!forced.restart_required);
+        assert_eq!(
+            forced.status,
+            "Software rendering is active. GPU availability was not checked."
+        );
+    }
 
     impl SettingsWindow {
         fn navbar_entry(&self) -> usize {

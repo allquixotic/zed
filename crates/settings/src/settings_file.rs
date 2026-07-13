@@ -1,9 +1,14 @@
-use crate::{settings_content::SettingsContent, settings_store::SettingsStore};
+use crate::{
+    settings_content::{SettingsContent, UserSettingsContent},
+    settings_store::SettingsStore,
+};
 use collections::HashSet;
 use fs::{Fs, PathEventKind};
 use futures::{StreamExt, channel::mpsc};
-use gpui::{App, BackgroundExecutor, ReadGlobal};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use gpui::{App, BackgroundExecutor, ReadGlobal, RendererPreference};
+use std::{io, path::Path, path::PathBuf, sync::Arc, time::Duration};
+
+use crate::settings_content::RootUserSettings;
 
 #[cfg(test)]
 mod tests {
@@ -13,6 +18,46 @@ mod tests {
     use gpui::TestAppContext;
     use serde_json::json;
     use std::path::Path;
+
+    #[test]
+    fn test_renderer_preference_bootstrap() {
+        assert_eq!(
+            renderer_preference_from_user_settings_result(Ok("{}".to_string())),
+            RendererPreference::Auto
+        );
+        assert_eq!(
+            renderer_preference_from_user_settings_result(Ok(
+                r#"{ "rendering_backend": "auto" }"#.to_string()
+            )),
+            RendererPreference::Auto
+        );
+        assert_eq!(
+            renderer_preference_from_user_settings_result(Ok(
+                r#"{ "rendering_backend": "software" }"#.to_string()
+            )),
+            RendererPreference::Software
+        );
+        assert_eq!(
+            renderer_preference_from_user_settings_result(Ok(
+                r#"{ "rendering_backend": "invalid" }"#.to_string()
+            )),
+            RendererPreference::Auto
+        );
+        assert_eq!(
+            renderer_preference_from_user_settings_result(Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "missing",
+            ))),
+            RendererPreference::Auto
+        );
+        assert_eq!(
+            renderer_preference_from_user_settings_result(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unreadable",
+            ))),
+            RendererPreference::Auto
+        );
+    }
 
     #[gpui::test]
     async fn test_watch_config_dir_reloads_tracked_file_on_rescan(cx: &mut TestAppContext) {
@@ -96,6 +141,29 @@ mod tests {
 }
 
 pub const EMPTY_THEME_NAME: &str = "empty-theme";
+
+pub fn renderer_preference_from_user_settings_file(path: &Path) -> RendererPreference {
+    renderer_preference_from_user_settings_result(std::fs::read_to_string(path))
+}
+
+fn renderer_preference_from_user_settings_result(
+    settings_text: io::Result<String>,
+) -> RendererPreference {
+    let preference = settings_text
+        .map_err(anyhow::Error::from)
+        .and_then(|settings_text| UserSettingsContent::parse_json_with_comments(&settings_text))
+        .map(|settings| settings.rendering_backend.unwrap_or_default());
+
+    match preference {
+        Ok(preference) => preference,
+        Err(error) => {
+            log::warn!(
+                "failed to read rendering backend from user settings; using automatic selection: {error:#}"
+            );
+            RendererPreference::Auto
+        }
+    }
+}
 
 /// Settings for visual tests that use proper fonts instead of Courier.
 /// Uses Helvetica Neue for UI (sans-serif) and Menlo for code (monospace),
@@ -280,4 +348,20 @@ pub fn update_settings_file_with_completion(
     update: impl 'static + Send + FnOnce(&mut SettingsContent, &App),
 ) -> futures::channel::oneshot::Receiver<anyhow::Result<()>> {
     SettingsStore::global(cx).update_settings_file_with_completion(fs, update)
+}
+
+pub fn update_root_user_settings_file(
+    fs: Arc<dyn Fs>,
+    cx: &App,
+    update: impl 'static + Send + FnOnce(&mut UserSettingsContent, &App),
+) {
+    SettingsStore::global(cx).update_root_user_settings_file(fs, update)
+}
+
+pub fn update_root_user_settings_file_with_completion(
+    fs: Arc<dyn Fs>,
+    cx: &App,
+    update: impl 'static + Send + FnOnce(&mut UserSettingsContent, &App),
+) -> futures::channel::oneshot::Receiver<anyhow::Result<()>> {
+    SettingsStore::global(cx).update_root_user_settings_file_with_completion(fs, update)
 }

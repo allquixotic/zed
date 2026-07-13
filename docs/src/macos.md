@@ -38,7 +38,7 @@ To build Zed from source, see the [macOS development documentation](./developmen
 - macOS 10.15.7 (Catalina) or later
 - Apple Silicon (M1/M2/M3/M4) or Intel processor
 
-Zed uses Metal for GPU-accelerated rendering, which is available on all supported macOS versions.
+Zed normally uses Metal for GPU-accelerated rendering. It automatically falls back to CPU software rendering if Metal cannot be initialized.
 
 ## Installing the CLI
 
@@ -132,7 +132,19 @@ zed file.txt       # Open a file
 
 ### GPU or rendering issues
 
-Zed uses Metal for rendering. If you experience graphical glitches:
+Zed normally uses Metal for rendering. If Metal cannot be initialized, Zed automatically starts with its native CPU software renderer. Automatic fallback is retried on every launch and does not change your settings.
+
+To use CPU rendering deliberately, select **Software (CPU)** under **Settings → Window & Layout → Window → Rendering Backend**, then restart Zed. You can also add this root-level user setting:
+
+```json
+{
+  "rendering_backend": "software"
+}
+```
+
+Set it back to `"auto"` to retry Metal on the next launch. Software mode uses opaque windows, disables vibrancy and transparent titlebars, and reduces nonessential visual effects.
+
+If you experience graphical glitches while using Metal:
 
 1. Ensure macOS is up to date
 2. Restart your Mac to reset the GPU state

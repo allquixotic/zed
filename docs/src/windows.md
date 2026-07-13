@@ -39,6 +39,7 @@ For detailed instructions on setting up and using remote development features, i
 - Check that your hardware and operating system version are compatible with Zed. See our [installation guide](./installation.md) for more information.
 - Update your GPU drivers from your GPU vendor (Intel/AMD/NVIDIA/Qualcomm).
 - Ensure hardware acceleration is enabled in Windows and not blocked by third‑party software.
+- Check the Rendering Backend row in Settings to see whether Zed automatically fell back to CPU software rendering.
 - Try launching Zed with no extensions or custom settings to isolate conflicts.
 
 ### Terminal issues
@@ -53,9 +54,19 @@ When prompted for credentials, use the graphical askpass dialog. If it doesn’t
 
 #### Zed fails to open / degraded performance
 
-Zed requires a DirectX 11 compatible GPU to run. If Zed fails to open, your GPU may not meet the minimum requirements.
+Zed uses Direct3D 11 for hardware-accelerated rendering. If no compatible hardware GPU can be initialized, Zed automatically starts with its native CPU software renderer instead of a WARP adapter. Automatic fallback is retried on every launch and does not change your settings.
 
-To check if your GPU supports DirectX 11, run the following command:
+To use CPU rendering deliberately, select **Software (CPU)** under **Settings → Window & Layout → Window → Rendering Backend**, then restart Zed. You can also add this root-level user setting:
+
+```json
+{
+  "rendering_backend": "software"
+}
+```
+
+Set it back to `"auto"` to retry hardware rendering on the next launch. This setting is user-wide and cannot be set in project settings or settings profiles. Software mode uses opaque windows and reduces nonessential visual effects.
+
+If Zed falls back to software rendering and you want to restore hardware rendering, check DirectX support by running:
 
 ```
 dxdiag
@@ -63,4 +74,4 @@ dxdiag
 
 This will open the DirectX Diagnostic Tool, which shows the DirectX version your GPU supports under `System` → `System Information` → `DirectX Version`.
 
-If you're running Zed inside a virtual machine, it will use the emulated adapter provided by your VM. While Zed will work in this environment, performance may be degraded.
+In a virtual machine without GPU passthrough, Zed uses its CPU software renderer. The Rendering Backend settings row and Zed log report the active backend and any hardware initialization failure.

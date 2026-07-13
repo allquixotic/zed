@@ -344,6 +344,8 @@ where
     serde::Serialize,
     serde::Deserialize,
     schemars::JsonSchema,
+    strum::VariantArray,
+    strum::VariantNames,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RendererPreference {
