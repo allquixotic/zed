@@ -68,7 +68,7 @@ pub fn current_platform_with_options(options: PlatformOptions) -> gpui::Result<R
 pub fn try_current_platform(options: PlatformOptions) -> gpui::Result<Rc<dyn Platform>> {
     #[cfg(target_os = "macos")]
     {
-        Ok(Rc::new(gpui_macos::MacPlatform::new(options.headless)))
+        Ok(Rc::new(gpui_macos::MacPlatform::new_with_options(options)))
     }
 
     #[cfg(target_os = "windows")]
@@ -95,9 +95,9 @@ pub fn try_current_platform(options: PlatformOptions) -> gpui::Result<Rc<dyn Pla
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
     #[cfg(target_os = "macos")]
     {
-        Some(Box::new(
-            gpui_macos::metal_renderer::MetalHeadlessRenderer::new(),
-        ))
+        gpui_macos::metal_renderer::MetalHeadlessRenderer::new()
+            .ok()
+            .map(|renderer| Box::new(renderer) as Box<dyn gpui::PlatformHeadlessRenderer>)
     }
 
     #[cfg(not(target_os = "macos"))]
