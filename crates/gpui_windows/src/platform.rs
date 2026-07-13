@@ -67,7 +67,7 @@ pub(crate) struct WindowsPlatformState {
     /// Shared with each window so `WM_SETCURSOR` can read it directly.
     pub(crate) cursor_visible: Arc<AtomicBool>,
     directx_devices: RefCell<Option<DirectXDevices>>,
-    directx_initialization_error: RefCell<Option<Arc<str>>>,
+    directx_initialization_error: RefCell<Option<CachedHardwareRendererInitializationError>>,
 }
 
 #[derive(Default)]
@@ -99,21 +99,23 @@ impl WindowsPlatformState {
         }
     }
 
-    fn directx_devices(&self) -> Result<DirectXDevices> {
+    fn directx_devices(
+        &self,
+    ) -> std::result::Result<DirectXDevices, CachedHardwareRendererInitializationError> {
         if let Some(devices) = self.directx_devices.borrow().clone() {
             return Ok(devices);
         }
         if let Some(error) = self.directx_initialization_error.borrow().clone() {
-            anyhow::bail!("DirectX device initialization previously failed: {error}");
+            return Err(error);
         }
-        match DirectXDevices::new().context("creating DirectX devices") {
+        match DirectXDevices::new_categorized() {
             Ok(devices) => {
                 *self.directx_devices.borrow_mut() = Some(devices.clone());
                 Ok(devices)
             }
             Err(error) => {
-                *self.directx_initialization_error.borrow_mut() =
-                    Some(Arc::from(format!("{error:#}")));
+                let error = CachedHardwareRendererInitializationError::new(&error);
+                *self.directx_initialization_error.borrow_mut() = Some(error.clone());
                 Err(error)
             }
         }
@@ -237,12 +239,9 @@ impl WindowsPlatform {
 
     fn generate_creation_info(&self) -> Result<WindowCreationInfo> {
         let renderer = match self.renderer_preference {
-            RendererPreference::Auto => WindowsRendererConfig::Hardware(
-                self.inner
-                    .state
-                    .directx_devices()
-                    .context("initializing hardware renderer")?,
-            ),
+            RendererPreference::Auto => {
+                WindowsRendererConfig::Auto(self.inner.state.directx_devices())
+            }
             RendererPreference::Software => WindowsRendererConfig::Software,
         };
         Ok(WindowCreationInfo {

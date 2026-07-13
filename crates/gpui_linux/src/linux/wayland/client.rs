@@ -639,7 +639,7 @@ impl WaylandClient {
         let compositor_gpu = (renderer_preference == RendererPreference::Auto)
             .then(detect_compositor_gpu)
             .flatten();
-        let gpu_context = Rc::new(RefCell::new(None));
+        let gpu_context = GpuContext::default();
 
         let seat = seat.unwrap();
         let globals = Globals::new(

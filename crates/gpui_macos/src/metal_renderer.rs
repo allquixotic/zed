@@ -137,12 +137,38 @@ pub struct PathRasterizationVertex {
 
 impl MetalRenderer {
     /// Creates a new MetalRenderer with a CAMetalLayer for window-based rendering.
+    #[allow(dead_code)]
     pub fn new(
         instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
         transparent: bool,
     ) -> Result<Self> {
-        let device = Self::create_device()?;
+        Self::new_categorized(instance_buffer_pool, transparent).map_err(|error| error.error)
+    }
 
+    pub(crate) fn new_categorized(
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        transparent: bool,
+    ) -> std::result::Result<Self, gpui::HardwareRendererInitializationError> {
+        let device = Self::create_device().map_err(|error| {
+            gpui::HardwareRendererInitializationError::new(
+                gpui::RendererFallbackReason::NoHardwareAdapter,
+                error,
+            )
+        })?;
+
+        Self::new_with_device(device, instance_buffer_pool, transparent).map_err(|error| {
+            gpui::HardwareRendererInitializationError::new(
+                gpui::RendererFallbackReason::DeviceInitialization,
+                error,
+            )
+        })
+    }
+
+    pub(crate) fn new_with_device(
+        device: metal::Device,
+        instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
+        transparent: bool,
+    ) -> Result<Self> {
         let layer = metal::MetalLayer::new();
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
@@ -176,7 +202,7 @@ impl MetalRenderer {
         Self::new_internal(device, None, true, instance_buffer_pool)
     }
 
-    fn create_device() -> Result<metal::Device> {
+    pub(crate) fn create_device() -> Result<metal::Device> {
         // Prefer low‐power integrated GPUs on Intel Mac. On Apple
         // Silicon, there is only ever one GPU, so this is equivalent to
         // `metal::Device::system_default()`.

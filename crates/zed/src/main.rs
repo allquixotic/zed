@@ -83,13 +83,15 @@ use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn build_application() -> Application {
-    let platform = gpui_platform::current_platform(false);
-    if std::env::var("ZED_EXPERIMENTAL_A11Y").as_deref() == Ok("1") {
+fn build_application() -> Result<Application> {
+    let platform = gpui_platform::try_current_platform(gpui::PlatformOptions::auto(false))
+        .context("failed to initialize platform")?;
+    let application = if std::env::var("ZED_EXPERIMENTAL_A11Y").as_deref() == Ok("1") {
         Application::with_platform(platform)
     } else {
         Application::new_inaccessible(platform)
-    }
+    };
+    Ok(application)
 }
 
 fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
@@ -120,7 +122,14 @@ fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
         .collect::<Vec<_>>().join("\n\n");
 
     eprintln!("{message}: {error_details}");
-    build_application()
+    let application = match build_application() {
+        Ok(application) => application,
+        Err(error) => {
+            eprintln!("{message}: {error:#}");
+            return;
+        }
+    };
+    application
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx| {
             if let Ok(window) = cx.open_window(gpui::WindowOptions::default(), |_, cx| {
@@ -340,7 +349,13 @@ fn main() {
     #[cfg(windows)]
     check_for_conpty_dll();
 
-    let app = build_application().with_assets(Assets);
+    let app = match build_application() {
+        Ok(application) => application.with_assets(Assets),
+        Err(error) => {
+            eprintln!("Zed failed to initialize its platform: {error:#}");
+            return;
+        }
+    };
 
     let app_db = db::AppDatabase::new();
     let system_id = app.background_executor().spawn(system_id());

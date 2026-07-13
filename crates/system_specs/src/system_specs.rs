@@ -1,5 +1,5 @@
-pub use gpui::GpuSpecs;
 use gpui::{App, AppContext as _, Task, Window, actions};
+pub use gpui::{GpuSpecs, RenderingInfo};
 use human_bytes::human_bytes;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use semver::Version;
@@ -25,6 +25,7 @@ pub struct SystemSpecs {
     architecture: &'static str,
     commit_sha: Option<String>,
     bundle_type: Option<String>,
+    renderer: Option<String>,
     gpu_specs: Option<String>,
 }
 
@@ -50,7 +51,9 @@ impl SystemSpecs {
         };
         let bundle_type = bundle_type();
 
-        let gpu_specs = window.gpu_specs().map(|specs| {
+        let rendering_info = window.rendering_info();
+        let renderer = Some(format_rendering_info(&rendering_info));
+        let gpu_specs = rendering_info.gpu_specs.map(|specs| {
             format!(
                 "{} || {} || {}",
                 specs.device_name, specs.driver_name, specs.driver_info
@@ -67,6 +70,7 @@ impl SystemSpecs {
                 memory,
                 architecture,
                 commit_sha,
+                renderer,
                 gpu_specs,
             }
         })
@@ -99,6 +103,7 @@ impl SystemSpecs {
             architecture,
             commit_sha,
             bundle_type,
+            renderer: None,
             gpu_specs: try_determine_available_gpus(),
         }
     }
@@ -133,6 +138,11 @@ impl Display for SystemSpecs {
         ]
         .into_iter()
         .chain(
+            self.renderer
+                .as_ref()
+                .map(|renderer| format!("Renderer: {renderer}")),
+        )
+        .chain(
             self.gpu_specs
                 .as_ref()
                 .map(|specs| format!("GPU: {}", specs)),
@@ -142,6 +152,17 @@ impl Display for SystemSpecs {
 
         write!(f, "{system_specs}")
     }
+}
+
+fn format_rendering_info(info: &RenderingInfo) -> String {
+    let fallback = info
+        .fallback_reason
+        .map(|reason| format!(", fallback: {reason:?}"))
+        .unwrap_or_default();
+    format!(
+        "{:?} (requested: {:?}, hardware: {:?}{fallback})",
+        info.active_backend, info.requested_preference, info.hardware_availability,
+    )
 }
 
 fn try_determine_available_gpus() -> Option<String> {

@@ -318,6 +318,32 @@ async fn upload_minidump(
                 active_gpu.is_software_emulated.to_string(),
             );
     }
+    if let Some(rendering_info) = metadata.active_rendering.as_ref() {
+        form = form
+            .text(
+                "sentry[contexts][Rendering][Description]",
+                "The renderer Zed was using",
+            )
+            .text("sentry[contexts][Rendering][type]", "rendering")
+            .text(
+                "sentry[contexts][Rendering][active_backend]",
+                format!("{:?}", rendering_info.active_backend),
+            )
+            .text(
+                "sentry[contexts][Rendering][requested_preference]",
+                format!("{:?}", rendering_info.requested_preference),
+            )
+            .text(
+                "sentry[contexts][Rendering][hardware_availability]",
+                format!("{:?}", rendering_info.hardware_availability),
+            )
+            .text_if_some(
+                "sentry[contexts][Rendering][fallback_reason]",
+                rendering_info
+                    .fallback_reason
+                    .map(|reason| format!("{reason:?}")),
+            );
+    }
 
     // TODO: feature-flag-context, and more of device-context like screen resolution, available ram, device model, etc
 

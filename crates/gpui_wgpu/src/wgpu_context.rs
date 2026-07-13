@@ -1,6 +1,8 @@
 #[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
 #[cfg(not(target_family = "wasm"))]
+use gpui::{HardwareRendererInitializationError, RendererFallbackReason};
+#[cfg(not(target_family = "wasm"))]
 use gpui_util::ResultExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +32,7 @@ impl WgpuContext {
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
         Self::new_with_options(instance, surface, compositor_gpu, false)
+            .map_err(|error| error.error)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -38,6 +41,16 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
+        Self::new_rejecting_software_categorized(instance, surface, compositor_gpu)
+            .map_err(|error| error.error)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_rejecting_software_categorized(
+        instance: wgpu::Instance,
+        surface: &wgpu::Surface<'_>,
+        compositor_gpu: Option<CompositorGpuHint>,
+    ) -> std::result::Result<Self, HardwareRendererInitializationError> {
         Self::new_with_options(instance, surface, compositor_gpu, true)
     }
 
@@ -47,7 +60,7 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<CompositorGpuHint>,
         reject_software: bool,
-    ) -> anyhow::Result<Self> {
+    ) -> std::result::Result<Self, HardwareRendererInitializationError> {
         let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
             Ok(val) => parse_pci_id(&val)
                 .context("Failed to parse device ID from `ZED_DEVICE_ID` environment variable")
@@ -218,17 +231,23 @@ impl WgpuContext {
         surface: &wgpu::Surface<'_>,
         compositor_gpu: Option<&CompositorGpuHint>,
         reject_software: bool,
-    ) -> anyhow::Result<(
-        wgpu::Adapter,
-        wgpu::Device,
-        wgpu::Queue,
-        bool,
-        TextureFormat,
-    )> {
+    ) -> std::result::Result<
+        (
+            wgpu::Adapter,
+            wgpu::Device,
+            wgpu::Queue,
+            bool,
+            TextureFormat,
+        ),
+        HardwareRendererInitializationError,
+    > {
         let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
 
         if adapters.is_empty() {
-            anyhow::bail!("No GPU adapters found");
+            return Err(HardwareRendererInitializationError::new(
+                RendererFallbackReason::NoHardwareAdapter,
+                anyhow::anyhow!("No GPU adapters found"),
+            ));
         }
 
         if let Some(device_id) = device_id_filter {
@@ -304,6 +323,9 @@ impl WgpuContext {
             );
         }
 
+        let mut hardware_adapter_found = false;
+        let mut last_error = None;
+
         // Test each adapter by creating a device and configuring the surface
         for adapter in adapters {
             let info = adapter.get_info();
@@ -316,6 +338,7 @@ impl WgpuContext {
                 );
                 continue;
             }
+            hardware_adapter_found = true;
 
             log::info!("Testing adapter: {} ({:?})...", info.name, info.backend);
 
@@ -334,18 +357,31 @@ impl WgpuContext {
                         color_atlas_texture_format,
                     ));
                 }
-                Err(e) => {
+                Err(error) => {
                     log::info!(
                         "  Adapter {} ({:?}) failed: {}, trying next...",
                         info.name,
                         info.backend,
-                        e
+                        error.error
                     );
+                    last_error = Some(error);
                 }
             }
         }
 
-        anyhow::bail!("No GPU adapter found that can configure the display surface")
+        if !hardware_adapter_found {
+            return Err(HardwareRendererInitializationError::new(
+                RendererFallbackReason::NoHardwareAdapter,
+                anyhow::anyhow!("No non-software GPU adapters found"),
+            ));
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            HardwareRendererInitializationError::new(
+                RendererFallbackReason::DeviceInitialization,
+                anyhow::anyhow!("No GPU adapter could initialize a rendering device"),
+            )
+        }))
     }
 
     /// Try to use an adapter with a surface by creating a device and testing configuration.
@@ -354,17 +390,31 @@ impl WgpuContext {
     async fn try_adapter_with_surface(
         adapter: &wgpu::Adapter,
         surface: &wgpu::Surface<'_>,
-    ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
+    ) -> std::result::Result<
+        (wgpu::Device, wgpu::Queue, bool, TextureFormat),
+        HardwareRendererInitializationError,
+    > {
         let caps = surface.get_capabilities(adapter);
         if caps.formats.is_empty() {
-            anyhow::bail!("no compatible surface formats");
+            return Err(HardwareRendererInitializationError::new(
+                RendererFallbackReason::SurfaceInitialization,
+                anyhow::anyhow!("no compatible surface formats"),
+            ));
         }
         if caps.alpha_modes.is_empty() {
-            anyhow::bail!("no compatible alpha modes");
+            return Err(HardwareRendererInitializationError::new(
+                RendererFallbackReason::SurfaceInitialization,
+                anyhow::anyhow!("no compatible alpha modes"),
+            ));
         }
 
         let (device, queue, dual_source_blending, color_atlas_texture_format) =
-            Self::create_device(adapter).await?;
+            Self::create_device(adapter).await.map_err(|error| {
+                HardwareRendererInitializationError::new(
+                    RendererFallbackReason::DeviceInitialization,
+                    error,
+                )
+            })?;
         let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
         let test_config = wgpu::SurfaceConfiguration {
@@ -382,7 +432,10 @@ impl WgpuContext {
 
         let error = error_scope.pop().await;
         if let Some(e) = error {
-            anyhow::bail!("surface configuration failed: {e}");
+            return Err(HardwareRendererInitializationError::new(
+                RendererFallbackReason::SurfaceInitialization,
+                anyhow::anyhow!("surface configuration failed: {e}"),
+            ));
         }
 
         Ok((

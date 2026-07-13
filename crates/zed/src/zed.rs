@@ -572,12 +572,17 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         #[cfg(not(any(test, target_os = "macos")))]
         initialize_file_watcher(window, cx);
 
-        if let Some(specs) = window.gpu_specs() {
-            log::info!("Using GPU: {:?}", specs);
-            show_software_emulation_warning_if_needed(specs.clone(), window, cx);
-            if let Some(crash_client) = cx.try_global::<CrashHandler>() {
-                crashes::set_gpu_info(&crash_client.0, specs);
-            }
+        let rendering_info = window.rendering_info();
+        log::info!(
+            "Using renderer: backend={:?}, requested={:?}, hardware={:?}, fallback={:?}, gpu={:?}",
+            rendering_info.active_backend,
+            rendering_info.requested_preference,
+            rendering_info.hardware_availability,
+            rendering_info.fallback_reason,
+            rendering_info.gpu_specs,
+        );
+        if let Some(crash_client) = cx.try_global::<CrashHandler>() {
+            crashes::set_rendering_info(&crash_client.0, rendering_info);
         }
 
         let edit_prediction_menu_handle = PopoverMenuHandle::default();
@@ -715,56 +720,6 @@ fn initialize_file_watcher(window: &mut Window, cx: &mut Context<Workspace>) {
                 cx.update(|cx| {
                     cx.open_url("https://zed.dev/docs/windows");
                     cx.quit()
-                });
-            }
-        })
-        .detach()
-    }
-}
-
-fn show_software_emulation_warning_if_needed(
-    specs: gpui::GpuSpecs,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    if specs.is_software_emulated && std::env::var("ZED_ALLOW_EMULATED_GPU").is_err() {
-        let (graphics_api, docs_url, open_url) = if cfg!(target_os = "windows") {
-            (
-                "DirectX",
-                "https://zed.dev/docs/windows",
-                "https://zed.dev/docs/windows",
-            )
-        } else {
-            (
-                "Vulkan",
-                "https://zed.dev/docs/linux",
-                "https://zed.dev/docs/linux#zed-fails-to-open-windows",
-            )
-        };
-        let message = format!(
-            db::indoc! {r#"
-            Zed uses {} for rendering and requires a compatible GPU.
-
-            Currently you are using a software emulated GPU ({}) which
-            will result in awful performance.
-
-            For troubleshooting see: {}
-            Set ZED_ALLOW_EMULATED_GPU=1 env var to permanently override.
-            "#},
-            graphics_api, specs.device_name, docs_url
-        );
-        let prompt = window.prompt(
-            PromptLevel::Critical,
-            "Unsupported GPU",
-            Some(&message),
-            &["Skip", "Troubleshoot and Quit"],
-            cx,
-        );
-        cx.spawn(async move |_, cx| {
-            if prompt.await == Ok(1) {
-                cx.update(|cx| {
-                    cx.open_url(open_url);
-                    cx.quit();
                 });
             }
         })

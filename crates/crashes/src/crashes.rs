@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{panic::Location, pin::Pin};
 
-use system_specs::GpuSpecs;
+use system_specs::{GpuSpecs, RenderingInfo};
 
 use std::{
     env,
@@ -180,6 +180,7 @@ pub struct CrashServer {
     initialization_params: Mutex<Option<InitCrashHandler>>,
     panic_info: Mutex<Option<CrashPanic>>,
     active_gpu: Mutex<Option<system_specs::GpuSpecs>>,
+    active_rendering: Mutex<Option<system_specs::RenderingInfo>>,
     user_info: Mutex<Option<UserInfo>>,
     abort_message_location: Mutex<Option<AbortMessageLocation>>,
     has_connection: Arc<AtomicBool>,
@@ -198,6 +199,8 @@ pub struct CrashInfo {
     pub abort_message: Option<String>,
     pub gpus: Vec<system_specs::GpuInfo>,
     pub active_gpu: Option<system_specs::GpuSpecs>,
+    #[serde(default)]
+    pub active_rendering: Option<system_specs::RenderingInfo>,
     pub user_info: Option<UserInfo>,
 }
 
@@ -251,6 +254,10 @@ pub fn set_gpu_info(crash_client: &Arc<Client>, specs: GpuSpecs) {
     send_crash_server_message(crash_client, CrashServerMessage::GPUInfo(specs));
 }
 
+pub fn set_rendering_info(crash_client: &Arc<Client>, info: RenderingInfo) {
+    send_crash_server_message(crash_client, CrashServerMessage::RenderingInfo(info));
+}
+
 pub fn set_user_info(crash_client: &Arc<Client>, info: UserInfo) {
     send_crash_server_message(crash_client, CrashServerMessage::UserInfo(info));
 }
@@ -260,6 +267,7 @@ enum CrashServerMessage {
     Init(InitCrashHandler),
     Panic(CrashPanic),
     GPUInfo(GpuSpecs),
+    RenderingInfo(RenderingInfo),
     UserInfo(UserInfo),
     AbortMessageLocation(AbortMessageLocation),
 }
@@ -431,6 +439,7 @@ impl minidumper::ServerHandler for CrashServer {
             minidump_error,
             abort_message,
             active_gpu: self.active_gpu.lock().clone(),
+            active_rendering: self.active_rendering.lock().clone(),
             gpus,
             user_info: self.user_info.lock().clone(),
         };
@@ -457,6 +466,10 @@ impl minidumper::ServerHandler for CrashServer {
             }
             CrashServerMessage::GPUInfo(gpu_specs) => {
                 self.active_gpu.lock().replace(gpu_specs);
+            }
+            CrashServerMessage::RenderingInfo(rendering_info) => {
+                *self.active_gpu.lock() = rendering_info.gpu_specs.clone();
+                self.active_rendering.lock().replace(rendering_info);
             }
             CrashServerMessage::UserInfo(user_info) => {
                 self.user_info.lock().replace(user_info);
@@ -670,6 +683,7 @@ pub fn crash_server(socket: &Path, logs_dir: PathBuf) {
                 abort_message_location: Mutex::default(),
                 has_connection,
                 active_gpu: Mutex::default(),
+                active_rendering: Mutex::default(),
                 logs_dir,
             }),
             &shutdown,
