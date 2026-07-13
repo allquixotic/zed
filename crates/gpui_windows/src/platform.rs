@@ -39,7 +39,6 @@ pub struct WindowsPlatform {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
-    direct_write_text_system: Option<Arc<DirectWriteTextSystem>>,
     drop_target_helper: Option<IDropTargetHelper>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
@@ -103,22 +102,19 @@ impl WindowsPlatform {
         unsafe {
             OleInitialize(None).context("unable to initialize Windows OLE")?;
         }
-        let (directx_devices, text_system, direct_write_text_system) = if !headless {
+        let (directx_devices, text_system) = if !headless {
             let devices = DirectXDevices::new().context("Creating DirectX devices")?;
             let dw_text_system = Arc::new(
-                DirectWriteTextSystem::new(&devices)
-                    .context("Error creating DirectWriteTextSystem")?,
+                DirectWriteTextSystem::new().context("Error creating DirectWriteTextSystem")?,
             );
             (
                 Some(devices),
                 dw_text_system.clone() as Arc<dyn PlatformTextSystem>,
-                Some(dw_text_system),
             )
         } else {
             (
                 None,
                 Arc::new(gpui::NoopTextSystem::new()) as Arc<dyn PlatformTextSystem>,
-                None,
             )
         };
 
@@ -194,7 +190,6 @@ impl WindowsPlatform {
             background_executor,
             foreground_executor,
             text_system,
-            direct_write_text_system,
             suspend_resume_notification: RefCell::new(None),
             disable_direct_composition,
             drop_target_helper,
@@ -301,14 +296,10 @@ impl WindowsPlatform {
         let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
             return;
         };
-        let Some(direct_write_text_system) = &self.direct_write_text_system else {
-            return;
-        };
         let mut directx_device = directx_devices;
         let platform_window: SafeHwnd = self.handle.into();
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
-        let text_system = Arc::downgrade(direct_write_text_system);
         let invalidate_devices = self.invalidate_devices.clone();
 
         std::thread::Builder::new()
@@ -325,7 +316,6 @@ impl WindowsPlatform {
                             platform_window.as_raw(),
                             validation_number,
                             &all_windows,
-                            &text_system,
                         ) {
                             panic!("Device lost: {err}");
                         }
@@ -1303,7 +1293,6 @@ fn handle_gpu_device_lost(
     platform_window: HWND,
     validation_number: usize,
     all_windows: &std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
-    text_system: &std::sync::Weak<DirectWriteTextSystem>,
 ) -> Result<()> {
     // Here we wait a bit to ensure the system has time to recover from the device lost state.
     // If we don't wait, the final drawing result will be blank.
@@ -1324,9 +1313,6 @@ fn handle_gpu_device_lost(
         );
     }
 
-    if let Some(text_system) = text_system.upgrade() {
-        text_system.handle_gpu_lost(&directx_devices)?;
-    }
     if let Some(all_windows) = all_windows.upgrade() {
         for window in all_windows.read().iter() {
             unsafe {

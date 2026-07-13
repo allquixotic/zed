@@ -17,12 +17,12 @@ test-support = ["gpui/test-support"]
 screen-capture = ["gpui/screen-capture", "scap"]
 
 [dependencies]
+anyhow.workspace = true
 gpui.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 accesskit.workspace = true
 accesskit_windows.workspace = true
-anyhow.workspace = true
 collections.workspace = true
 dunce.workspace = true
 etagere = "0.2"
