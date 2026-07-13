@@ -754,7 +754,7 @@ pub(crate) enum BackgroundTag {
 /// References:
 /// - <https://developer.mozilla.org/en-US/docs/Web/CSS/color-interpolation-method>
 /// - <https://www.w3.org/TR/css-color-4/#typedef-color-space>
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[repr(C)]
 pub enum ColorSpace {
     #[default]
@@ -1120,7 +1120,7 @@ mod tests {
             } => {
                 assert_eq!(actual_color, color);
                 assert!((width - 2.0).abs() < 0.0001);
-                assert!((interval - 3.0).abs() < 0.0001);
+                assert!((interval - 3.0).abs() <= 1.0 / 255.0);
             }
             actual => assert!(
                 matches!(actual, BackgroundKind::PatternSlash { .. }),

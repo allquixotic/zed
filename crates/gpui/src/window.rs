@@ -4216,15 +4216,26 @@ impl Window {
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
         use crate::PaintSurface;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_SURFACE_FRAME_REVISION: AtomicU64 = AtomicU64::new(1);
 
         self.invalidator.debug_assert_paint();
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
+        let frame_revision = match NEXT_SURFACE_FRAME_REVISION.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |revision| Some(revision.saturating_add(1)),
+        ) {
+            Ok(revision) | Err(revision) => revision,
+        };
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
+            frame_revision,
             image_buffer,
         });
     }

@@ -8064,9 +8064,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "core-video",
+ "criterion",
  "etagere",
  "gpui",
+ "log",
  "parking_lot",
+ "raw-window-handle",
+ "rayon",
  "softbuffer",
  "vello_cpu",
 ]

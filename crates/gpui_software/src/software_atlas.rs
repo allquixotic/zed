@@ -390,6 +390,7 @@ mod tests {
             .context("cached tile was not returned")?;
 
         assert_eq!(first, second);
+        assert_eq!(first.padding, 0);
         assert_eq!(builds.load(Ordering::SeqCst), 1);
         let snapshot = atlas.tile(first)?;
         assert_eq!(snapshot.revision, 1);
@@ -427,6 +428,7 @@ mod tests {
         let second = atlas
             .get_or_insert_with(&second_key, &mut build)?
             .context("second tile was not inserted")?;
+        assert_eq!(second.texture_id.index, first.texture_id.index);
         assert!(atlas.tile(second)?.revision > first_revision);
         Ok(())
     }

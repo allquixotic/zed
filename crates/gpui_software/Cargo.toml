@@ -22,6 +22,19 @@ anyhow.workspace = true
 collections.workspace = true
 etagere = "0.2"
 gpui.workspace = true
+log.workspace = true
 parking_lot.workspace = true
+rayon.workspace = true
+raw-window-handle = "0.6"
 softbuffer.workspace = true
 vello_cpu.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-video.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "software_renderer"
+harness = false
