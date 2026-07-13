@@ -30,9 +30,9 @@ use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
     KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
-    WindowParams, popup::PopupNotSupportedError,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformOptions,
+    PlatformTextSystem, PlatformWindow, RendererPreference, Result, SystemMenuType, Task,
+    ThermalState, WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
 };
 use gpui_util::{ResultExt, new_std_command};
 use itertools::Itertools;
@@ -169,6 +169,7 @@ pub(crate) struct MacPlatformState {
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     renderer_context: renderer::Context,
+    renderer_preference: RendererPreference,
     headless: bool,
     general_pasteboard: Pasteboard,
     find_pasteboard: Pasteboard,
@@ -193,6 +194,10 @@ pub(crate) struct MacPlatformState {
 
 impl MacPlatform {
     pub fn new(headless: bool) -> Self {
+        Self::new_with_options(PlatformOptions::auto(headless))
+    }
+
+    pub fn new_with_options(options: PlatformOptions) -> Self {
         let dispatcher = Arc::new(MacDispatcher::new());
 
         #[cfg(feature = "font-kit")]
@@ -200,7 +205,7 @@ impl MacPlatform {
 
         #[cfg(not(feature = "font-kit"))]
         let text_system = {
-            if !headless {
+            if !options.headless {
                 log::warn!(
                     "gpui_macos was compiled without the `font-kit` feature, so no text will be rendered."
                 );
@@ -212,11 +217,12 @@ impl MacPlatform {
         let keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
 
         Self(Mutex::new(MacPlatformState {
-            headless,
+            headless: options.headless,
             text_system,
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
             renderer_context: renderer::Context::default(),
+            renderer_preference: options.renderer_preference,
             general_pasteboard: Pasteboard::general(),
             find_pasteboard: Pasteboard::find(),
             reopen: None,
@@ -647,13 +653,20 @@ impl Platform for MacPlatform {
             return Err(PopupNotSupportedError.into());
         }
 
-        let (cursor_visible, foreground_executor, background_executor, renderer_context) = {
+        let (
+            cursor_visible,
+            foreground_executor,
+            background_executor,
+            renderer_context,
+            renderer_preference,
+        ) = {
             let guard = self.0.lock();
             (
                 guard.cursor_visible.clone(),
                 guard.foreground_executor.clone(),
                 guard.background_executor.clone(),
                 guard.renderer_context.clone(),
+                guard.renderer_preference,
             )
         };
 
@@ -664,7 +677,8 @@ impl Platform for MacPlatform {
             foreground_executor,
             background_executor,
             renderer_context,
-        )))
+            renderer_preference,
+        )?))
     }
 
     fn window_appearance(&self) -> WindowAppearance {

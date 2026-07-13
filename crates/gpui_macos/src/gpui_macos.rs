@@ -10,14 +10,13 @@ mod display_link;
 mod events;
 mod keyboard;
 mod pasteboard;
+mod renderer;
 
 #[cfg(feature = "screen-capture")]
 mod screen_capture;
 
 mod metal_atlas;
 pub mod metal_renderer;
-
-use metal_renderer as renderer;
 
 #[cfg(feature = "font-kit")]
 mod open_type;

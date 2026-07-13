@@ -4,7 +4,6 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
-#[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
@@ -29,9 +28,9 @@ use gpui::{
     FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, SharedString, Size, SystemWindowTab, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams, point,
-    px, size,
+    PromptLevel, RendererPreference, RenderingInfo, RequestFrameOptions, SharedString, Size,
+    SystemWindowTab, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowKind, WindowParams, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -773,7 +772,8 @@ impl MacWindow {
         foreground_executor: ForegroundExecutor,
         background_executor: BackgroundExecutor,
         renderer_context: renderer::Context,
-    ) -> Self {
+        renderer_preference: RendererPreference,
+    ) -> Result<Self> {
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
 
@@ -882,6 +882,23 @@ impl MacWindow {
             let native_view = NSView::initWithFrame_(native_view, NSView::bounds(content_view));
             assert!(!native_view.is_null());
 
+            let renderer = match renderer::new_renderer(
+                renderer_context,
+                native_window as *mut _,
+                native_view as *mut _,
+                bounds.size.map(|pixels| pixels.as_f32()),
+                false,
+                renderer_preference,
+            ) {
+                Ok(renderer) => renderer,
+                Err(error) => {
+                    let _: () = msg_send![native_view, release];
+                    let _: () = msg_send![native_window, release];
+                    pool.drain();
+                    return Err(error);
+                }
+            };
+
             let mut window = Self(Arc::new(Mutex::new(MacWindowState {
                 handle,
                 foreground_executor,
@@ -893,13 +910,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
-                renderer: renderer::new_renderer(
-                    renderer_context,
-                    native_window as *mut _,
-                    native_view as *mut _,
-                    bounds.size.map(|pixels| pixels.as_f32()),
-                    false,
-                ),
+                renderer,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -915,9 +926,10 @@ impl MacWindow {
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
                 traffic_light_frames: None,
-                transparent_titlebar: titlebar
-                    .as_ref()
-                    .is_none_or(|titlebar| titlebar.appears_transparent),
+                transparent_titlebar: renderer_preference != RendererPreference::Software
+                    && titlebar
+                        .as_ref()
+                        .is_none_or(|titlebar| titlebar.appears_transparent),
                 previous_modifiers_changed_event: None,
                 keystroke_for_do_command: None,
                 do_command_handled: None,
@@ -962,7 +974,9 @@ impl MacWindow {
                 });
             }
 
-            if titlebar.is_none_or(|titlebar| titlebar.appears_transparent) {
+            if renderer_preference != RendererPreference::Software
+                && titlebar.is_none_or(|titlebar| titlebar.appears_transparent)
+            {
                 native_window.setTitlebarAppearsTransparent_(YES);
                 native_window.setTitleVisibility_(NSWindowTitleVisibility::NSWindowTitleHidden);
             }
@@ -1098,7 +1112,7 @@ impl MacWindow {
 
             pool.drain();
 
-            window
+            Ok(window)
         }
     }
 
@@ -1524,6 +1538,11 @@ impl PlatformWindow for MacWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();
+        let background_appearance = if this.renderer.is_software() {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            background_appearance
+        };
         this.background_appearance = background_appearance;
 
         let opaque = background_appearance == WindowBackgroundAppearance::Opaque;
@@ -1762,15 +1781,21 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        let scale_factor = this.scale_factor();
+        let size = this.content_size().to_device_pixels(scale_factor);
+        this.renderer.draw(scene, size, scale_factor).log_err();
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        self.0.lock().renderer.sprite_atlas().clone()
+        self.0.lock().renderer.sprite_atlas()
+    }
+
+    fn rendering_info(&self) -> RenderingInfo {
+        self.0.lock().renderer.rendering_info()
     }
 
     fn gpu_specs(&self) -> Option<gpui::GpuSpecs> {
-        None
+        self.rendering_info().gpu_specs
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {
@@ -1856,7 +1881,9 @@ impl PlatformWindow for MacWindow {
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();
-        this.renderer.render_to_image(scene)
+        let scale_factor = this.scale_factor();
+        let size = this.content_size().to_device_pixels(scale_factor);
+        this.renderer.render_to_image(scene, size, scale_factor)
     }
 
     fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
@@ -2622,9 +2649,13 @@ extern "C" fn close_window(this: &Object, _: Sel) {
 }
 
 extern "C" fn make_backing_layer(this: &Object, _: Sel) -> id {
-    let window_state = unsafe { get_window_state(this) };
-    let window_state = window_state.as_ref().lock();
-    window_state.renderer.layer_ptr() as id
+    let raw: *mut c_void = unsafe { *this.get_ivar(WINDOW_STATE_IVAR) };
+    if raw.is_null() {
+        unsafe { msg_send![super(this, class!(NSView)), makeBackingLayer] }
+    } else {
+        let window_state = unsafe { get_window_state(this) };
+        window_state.as_ref().lock().renderer.layer_ptr()
+    }
 }
 
 extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel) {
