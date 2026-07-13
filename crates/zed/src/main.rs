@@ -84,8 +84,13 @@ use crate::zed::{CrashHandler, OpenRequestKind, eager_load_active_theme_and_icon
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn build_application() -> Result<Application> {
-    let platform = gpui_platform::try_current_platform(gpui::PlatformOptions::auto(false))
-        .context("failed to initialize platform")?;
+    let renderer_preference =
+        settings::renderer_preference_from_user_settings_file(paths::settings_file());
+    let platform = gpui_platform::try_current_platform(gpui::PlatformOptions {
+        headless: false,
+        renderer_preference,
+    })
+    .context("failed to initialize platform")?;
     let application = if std::env::var("ZED_EXPERIMENTAL_A11Y").as_deref() == Ok("1") {
         Application::with_platform(platform)
     } else {

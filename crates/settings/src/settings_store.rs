@@ -633,6 +633,26 @@ impl SettingsStore {
         })
     }
 
+    pub fn update_root_user_settings_file(
+        &self,
+        fs: Arc<dyn Fs>,
+        update: impl 'static + Send + FnOnce(&mut UserSettingsContent, &App),
+    ) {
+        drop(self.update_root_user_settings_file_with_completion(fs, update));
+    }
+
+    pub fn update_root_user_settings_file_with_completion(
+        &self,
+        fs: Arc<dyn Fs>,
+        update: impl 'static + Send + FnOnce(&mut UserSettingsContent, &App),
+    ) -> oneshot::Receiver<Result<()>> {
+        self.update_settings_file_inner(fs, move |old_text: String, cx: AsyncApp| {
+            cx.read_global(|store: &SettingsStore, cx| {
+                store.new_text_for_root_update(old_text, |content| update(content, cx))
+            })
+        })
+    }
+
     pub fn import_vscode_settings(
         &self,
         fs: Arc<dyn Fs>,
@@ -833,7 +853,15 @@ impl SettingsStore {
         old_text: String,
         update: impl FnOnce(&mut SettingsContent),
     ) -> Result<String> {
-        let edits = self.edits_for_update(&old_text, update)?;
+        self.new_text_for_root_update(old_text, |content| update(&mut content.content))
+    }
+
+    pub fn new_text_for_root_update(
+        &self,
+        old_text: String,
+        update: impl FnOnce(&mut UserSettingsContent),
+    ) -> Result<String> {
+        let edits = self.edits_for_root_update(&old_text, update)?;
         let mut new_text = old_text;
         for (range, replacement) in edits.into_iter() {
             new_text.replace_range(range, &replacement);
@@ -854,6 +882,14 @@ impl SettingsStore {
         text: &str,
         update: impl FnOnce(&mut SettingsContent),
     ) -> Result<Vec<(Range<usize>, String)>> {
+        self.edits_for_root_update(text, |content| update(&mut content.content))
+    }
+
+    pub fn edits_for_root_update(
+        &self,
+        text: &str,
+        update: impl FnOnce(&mut UserSettingsContent),
+    ) -> Result<Vec<(Range<usize>, String)>> {
         let old_content = if text.trim().is_empty() {
             UserSettingsContent::default()
         } else {
@@ -865,7 +901,7 @@ impl SettingsStore {
                 .context("Settings file could not be parsed. Fix syntax errors before updating.")?
         };
         let mut new_content = old_content.clone();
-        update(&mut new_content.content);
+        update(&mut new_content);
 
         let old_value = serde_json::to_value(&old_content).unwrap();
         let new_value = serde_json::to_value(new_content).unwrap();
@@ -2165,6 +2201,36 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_root_user_settings_update_preserves_other_content(cx: &mut App) {
+        let store = SettingsStore::new(cx, &test_settings());
+        let old_json = r#"{
+            "some_unknown_key": "preserved",
+            "auto_update": false,
+            "profiles": {
+                "Focused": {
+                    "name": "Focused",
+                    "settings": {
+                        "ui_font_size": 16
+                    }
+                }
+            }
+        }"#
+        .unindent();
+
+        let new_json = store
+            .new_text_for_root_update(old_json, |settings| {
+                settings.rendering_backend = Some(gpui::RendererPreference::Software);
+            })
+            .unwrap();
+        let value: serde_json::Value = serde_json_lenient::from_str(&new_json).unwrap();
+
+        assert_eq!(value["rendering_backend"], "software");
+        assert_eq!(value["some_unknown_key"], "preserved");
+        assert_eq!(value["auto_update"], false);
+        assert_eq!(value["profiles"]["Focused"]["settings"]["ui_font_size"], 16);
+    }
+
+    #[gpui::test]
     fn test_edits_for_update_returns_error_on_invalid_json(cx: &mut App) {
         let store = SettingsStore::new(cx, &test_settings());
 
@@ -3192,5 +3258,7 @@ mod tests {
 
         assert!(user_schema_str.contains("\"auto_update\""));
         assert!(!project_schema_str.contains("\"auto_update\""));
+        assert!(user_schema_str.contains("\"rendering_backend\""));
+        assert!(!project_schema_str.contains("\"rendering_backend\""));
     }
 }

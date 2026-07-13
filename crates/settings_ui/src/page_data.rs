@@ -4781,9 +4781,10 @@ fn window_and_layout_page() -> SettingsPage {
         ]
     }
 
-    fn window_section() -> [SettingsPageItem; 3] {
+    fn window_section() -> [SettingsPageItem; 4] {
         [
             SettingsPageItem::SectionHeader("Window"),
+            SettingsPageItem::RenderingBackend,
             // todo(settings_ui): Should we filter by platform.as_ref()?
             SettingsPageItem::SettingItem(SettingItem {
                 title: "Use System Window Tabs",

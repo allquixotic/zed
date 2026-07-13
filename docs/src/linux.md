@@ -21,7 +21,7 @@ curl -f https://zed.dev/install.sh | ZED_CHANNEL=preview sh
 
 The Zed installed by the script works best on systems that:
 
-- have a Vulkan compatible GPU available (for example Linux on an M-series MacBook)
+- have a Vulkan compatible GPU available for hardware-accelerated rendering (for example Linux on an M-series MacBook); Zed also supports CPU software rendering
 - have a system-wide glibc
   - x86_64 (Intel/AMD): glibc version >= 2.31 (Ubuntu 20 and newer)
   - aarch64 (ARM): glibc version >= 2.35 (Ubuntu 22 and newer)
@@ -144,9 +144,19 @@ If you see an error like "/lib64/libc.so.6: version 'GLIBC_2.29' not found" it m
 
 #### Zed fails to open windows
 
-Zed requires a GPU to run effectively. Under the hood, we use [Vulkan](https://www.vulkan.org/) to communicate with your GPU. If you are seeing problems with performance, or Zed fails to load, it is possible that Vulkan is the culprit.
+Zed uses [Vulkan](https://www.vulkan.org/) for hardware-accelerated rendering. If no compatible hardware GPU can be initialized, Zed automatically starts with its native CPU software renderer instead. Automatic fallback is retried on every launch and does not change your settings.
 
-If you see a notification saying `Zed failed to open a window: NoSupportedDeviceFound` this means that Vulkan cannot find a compatible GPU. You can try running [vkcube](https://github.com/krh/vkcube) (usually available as part of the `vulkaninfo` or `vulkan-tools` package on various distributions) to try to troubleshoot where the issue is coming from like so:
+You can also select **Software (CPU)** under **Settings → Window & Layout → Window → Rendering Backend**. Restart Zed to apply the change. To set it directly in your user settings, add this root-level setting:
+
+```json
+{
+  "rendering_backend": "software"
+}
+```
+
+Set the value back to `"auto"` to retry hardware rendering on the next launch. This setting is user-wide and cannot be set in project settings or settings profiles. Software mode uses opaque windows and reduces nonessential visual effects.
+
+If Zed falls back to software rendering and you want to restore hardware rendering, you can run [vkcube](https://github.com/krh/vkcube) (usually available as part of the `vulkaninfo` or `vulkan-tools` package on various distributions) to troubleshoot Vulkan:
 
 ```
 vkcube
@@ -156,7 +166,7 @@ vkcube
 
 This should output a line describing your current graphics setup and show a rotating cube. If this does not work, you should be able to fix it by installing Vulkan compatible GPU drivers, however in some cases there is no Vulkan support yet.
 
-You can find out which graphics card Zed is using by looking in the Zed log (`~/.local/share/zed/logs/Zed.log`) for `Using GPU: ...`.
+You can find the active rendering backend and, when available, the selected graphics adapter in the Zed log (`~/.local/share/zed/logs/Zed.log`) or in the Rendering Backend settings row.
 
 If you see errors like `ERROR_INITIALIZATION_FAILED` or `GPU Crashed` or `ERROR_SURFACE_LOST_KHR` then you may be able to work around this by installing different drivers for your GPU, or by selecting a different GPU to run on. (See [#14225](https://github.com/zed-industries/zed/issues/14225))
 
