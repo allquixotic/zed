@@ -73,8 +73,8 @@ pub fn try_current_platform(options: PlatformOptions) -> gpui::Result<Rc<dyn Pla
 
     #[cfg(target_os = "windows")]
     {
-        Ok(Rc::new(gpui_windows::WindowsPlatform::new(
-            options.headless,
+        Ok(Rc::new(gpui_windows::WindowsPlatform::new_with_options(
+            options,
         )?))
     }
 
