@@ -26,6 +26,9 @@
 //!
 //! # Update baselines when UI intentionally changes
 //! UPDATE_BASELINES=1 cargo test -p zed visual_tests -- --ignored --test-threads=1
+//!
+//! # Exercise the CPU renderer
+//! ZED_VISUAL_TEST_RENDERER=software cargo run -p zed --bin zed_visual_test_runner --features visual-tests
 //! ```
 //!
 //! ## Screenshot Output
@@ -35,13 +38,28 @@
 
 use anyhow::{Result, anyhow};
 use gpui::{
-    AnyWindowHandle, AppContext as _, Empty, Size, VisualTestAppContext, WindowHandle, px, size,
+    AnyWindowHandle, AppContext as _, Empty, PlatformOptions, RendererPreference, Size,
+    VisualTestAppContext, WindowHandle, px, size,
 };
 use image::{ImageBuffer, Rgba, RgbaImage};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use workspace::AppState;
+
+fn visual_test_platform() -> Result<Rc<dyn gpui::Platform>> {
+    let renderer_preference =
+        if std::env::var("ZED_VISUAL_TEST_RENDERER").as_deref() == Ok("software") {
+            RendererPreference::Software
+        } else {
+            RendererPreference::Auto
+        };
+    gpui_platform::current_platform_with_options(PlatformOptions {
+        headless: false,
+        renderer_preference,
+    })
+}
 
 /// Initialize a visual test context with all necessary Zed subsystems.
 pub fn init_visual_test(cx: &mut VisualTestAppContext) -> Arc<AppState> {
@@ -425,20 +443,19 @@ mod tests {
 
     #[test]
     #[ignore]
-    fn test_visual_test_smoke() {
-        let mut cx = VisualTestAppContext::new(gpui_platform::current_platform(false));
+    fn test_visual_test_smoke() -> Result<()> {
+        let mut cx = VisualTestAppContext::new(visual_test_platform()?);
 
-        let _window = cx
-            .open_offscreen_window_default(|_, cx| cx.new(|_| Empty))
-            .expect("Failed to open offscreen window");
+        let _window = cx.open_offscreen_window_default(|_, cx| cx.new(|_| Empty))?;
 
         cx.run_until_parked();
+        Ok(())
     }
 
     #[test]
     #[ignore]
-    fn test_workspace_opens() {
-        let mut cx = VisualTestAppContext::new(gpui_platform::current_platform(false));
+    fn test_workspace_opens() -> Result<()> {
+        let mut cx = VisualTestAppContext::new(visual_test_platform()?);
         let app_state = init_visual_test(&mut cx);
 
         gpui::block_on(async {
@@ -456,14 +473,10 @@ mod tests {
                 .await;
         });
 
-        let workspace_result = gpui::block_on(open_test_workspace(app_state, &mut cx));
-        assert!(
-            workspace_result.is_ok(),
-            "Failed to open workspace: {:?}",
-            workspace_result.err()
-        );
+        let _workspace = gpui::block_on(open_test_workspace(app_state, &mut cx))?;
 
         cx.run_until_parked();
+        Ok(())
     }
 
     /// This test captures a screenshot of an empty Zed workspace.
@@ -478,8 +491,8 @@ mod tests {
     /// where screen capture isn't available.
     #[test]
     #[ignore]
-    fn test_workspace_screenshot() {
-        let mut cx = VisualTestAppContext::new(gpui_platform::current_platform(false));
+    fn test_workspace_screenshot() -> Result<()> {
+        let mut cx = VisualTestAppContext::new(visual_test_platform()?);
         let app_state = init_visual_test(&mut cx);
 
         gpui::block_on(async {
@@ -498,8 +511,7 @@ mod tests {
                 .await;
         });
 
-        let workspace = gpui::block_on(open_test_workspace(app_state, &mut cx))
-            .expect("Failed to open workspace");
+        let workspace = gpui::block_on(open_test_workspace(app_state, &mut cx))?;
 
         gpui::block_on(async {
             wait_for_ui_stabilization(&cx).await;
@@ -547,5 +559,6 @@ mod tests {
         });
 
         cx.run_until_parked();
+        Ok(())
     }
 }
