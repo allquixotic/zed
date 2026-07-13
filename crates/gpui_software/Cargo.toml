@@ -1,0 +1,27 @@
+[package]
+name = "gpui_software"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+description = "CPU scene rendering and framebuffer presentation for GPUI"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/gpui_software.rs"
+
+[features]
+default = []
+wayland = ["softbuffer/wayland", "softbuffer/wayland-dlopen"]
+x11 = ["softbuffer/x11", "softbuffer/x11-dlopen"]
+
+[dependencies]
+anyhow.workspace = true
+collections.workspace = true
+etagere = "0.2"
+gpui.workspace = true
+parking_lot.workspace = true
+softbuffer.workspace = true
+vello_cpu.workspace = true
