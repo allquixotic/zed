@@ -7947,6 +7947,7 @@ dependencies = [
  "futures 0.3.32",
  "gpui",
  "gpui_cosmic_text",
+ "gpui_software",
  "gpui_util",
  "gpui_wgpu",
  "http_client",

@@ -1,15 +1,16 @@
 use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
-use crate::linux::X11ClientStatePtr;
+use crate::linux::{LinuxRenderer, X11ClientStatePtr};
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, popup::PopupNotSupportedError, px,
+    Point, PromptButton, PromptLevel, RendererPreference, RenderingInfo, RequestFrameOptions,
+    ResizeEdge, Rgba, ScaledPixels, Scene, Size, Tiling, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations, WindowKind,
+    WindowParams, popup::PopupNotSupportedError, px,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{CompositorGpuHint, WgpuSurfaceConfig};
 
 use collections::FxHashSet;
 use gpui_util::{ResultExt, maybe};
@@ -268,7 +269,7 @@ pub struct X11WindowState {
     pub(crate) last_sync_counter: Option<sync::Int64>,
     bounds: Bounds<Pixels>,
     scale_factor: f32,
-    renderer: WgpuRenderer,
+    renderer: LinuxRenderer<RawWindow>,
     display: Rc<dyn PlatformDisplay>,
     input_handler: Option<PlatformInputHandler>,
     appearance: WindowAppearance,
@@ -290,7 +291,8 @@ pub struct X11WindowState {
 
 impl X11WindowState {
     fn is_transparent(&self) -> bool {
-        self.background_appearance != WindowBackgroundAppearance::Opaque
+        !self.renderer.is_software()
+            && self.background_appearance != WindowBackgroundAppearance::Opaque
     }
 }
 
@@ -416,6 +418,7 @@ impl X11WindowState {
         executor: ForegroundExecutor,
         gpu_context: gpui_wgpu::GpuContext,
         compositor_gpu: Option<CompositorGpuHint>,
+        renderer_preference: RendererPreference,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
@@ -440,10 +443,11 @@ impl X11WindowState {
 
         let visual_set = find_visuals(xcb, x_screen_index);
 
-        let visual = match visual_set.transparent {
-            Some(visual) => visual,
-            None => {
-                log::warn!("Unable to find a transparent visual",);
+        let visual = match (renderer_preference, visual_set.transparent) {
+            (RendererPreference::Software, _) => visual_set.inherit,
+            (_, Some(visual)) => visual,
+            (_, None) => {
+                log::warn!("Unable to find a transparent visual");
                 visual_set.inherit
             }
         };
@@ -730,7 +734,13 @@ impl X11WindowState {
                     transparent: false,
                     preferred_present_mode: None,
                 };
-                WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
+                LinuxRenderer::new(
+                    gpu_context,
+                    raw_window,
+                    config,
+                    compositor_gpu,
+                    renderer_preference,
+                )?
             };
 
             renderer.set_subpixel_layout(is_bgr);
@@ -884,6 +894,7 @@ impl X11Window {
         executor: ForegroundExecutor,
         gpu_context: gpui_wgpu::GpuContext,
         compositor_gpu: Option<CompositorGpuHint>,
+        renderer_preference: RendererPreference,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
         client_side_decorations_supported: bool,
@@ -903,6 +914,7 @@ impl X11Window {
                 executor,
                 gpu_context,
                 compositor_gpu,
+                renderer_preference,
                 params,
                 xcb,
                 client_side_decorations_supported,
@@ -1583,7 +1595,11 @@ impl PlatformWindow for X11Window {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut state = self.0.state.borrow_mut();
-        state.background_appearance = background_appearance;
+        state.background_appearance = if state.renderer.is_software() {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            background_appearance
+        };
         let transparent = state.is_transparent();
         state.renderer.update_transparency(transparent);
     }
@@ -1593,21 +1609,7 @@ impl PlatformWindow for X11Window {
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        self.0
-            .state
-            .borrow()
-            .client
-            .0
-            .upgrade()
-            .map(|ref_cell| {
-                let state = ref_cell.borrow();
-                state
-                    .gpu_context
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|ctx| ctx.supports_dual_source_blending())
-            })
-            .unwrap_or_default()
+        self.0.state.borrow().renderer.supports_subpixel_rendering()
     }
 
     fn minimize(&self) {
@@ -1723,7 +1725,22 @@ impl PlatformWindow for X11Window {
             return;
         }
 
-        inner.renderer.draw(scene);
+        let size = inner.bounds.to_device_pixels(inner.scale_factor).size;
+        let scale_factor = inner.scale_factor;
+        inner
+            .renderer
+            .draw(
+                scene,
+                size,
+                scale_factor,
+                Rgba {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+            )
+            .log_err();
 
         if inner.renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
@@ -1732,7 +1749,7 @@ impl PlatformWindow for X11Window {
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let inner = self.0.state.borrow();
-        inner.renderer.sprite_atlas().clone()
+        inner.renderer.sprite_atlas()
     }
 
     fn show_window_menu(&self, position: Point<Pixels>) {
@@ -1920,8 +1937,12 @@ impl PlatformWindow for X11Window {
         client.update_ime_position(bounds);
     }
 
+    fn rendering_info(&self) -> RenderingInfo {
+        self.0.state.borrow().renderer.rendering_info()
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        self.0.state.borrow().renderer.gpu_specs().into()
+        self.rendering_info().gpu_specs
     }
 
     fn play_system_bell(&self) {

@@ -61,8 +61,8 @@ use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_x
 use gpui::{
     AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformInput,
-    PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
-    TouchPhase, WindowButtonLayout, WindowParams, point, px,
+    PlatformKeyboardLayout, PlatformWindow, Point, RendererPreference, RequestFrameOptions,
+    ScrollDelta, Size, TouchPhase, WindowButtonLayout, WindowParams, point, px,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 
@@ -180,6 +180,7 @@ pub struct X11ClientState {
 
     pub(crate) gpu_context: GpuContext,
     pub(crate) compositor_gpu: Option<CompositorGpuHint>,
+    pub(crate) renderer_preference: RendererPreference,
 
     pub(crate) scale_factor: f32,
 
@@ -306,7 +307,7 @@ impl X11ClientStatePtr {
 pub(crate) struct X11Client(pub(crate) Rc<RefCell<X11ClientState>>);
 
 impl X11Client {
-    pub(crate) fn new() -> anyhow::Result<Self> {
+    pub(crate) fn new(renderer_preference: RendererPreference) -> anyhow::Result<Self> {
         let event_loop = EventLoop::try_new()?;
 
         let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
@@ -451,7 +452,9 @@ impl X11Client {
         let clipboard = Clipboard::new().context("Failed to initialize clipboard")?;
 
         let screen = &xcb_connection.setup().roots[x_root_index];
-        let compositor_gpu = detect_compositor_gpu(&xcb_connection, screen);
+        let compositor_gpu = (renderer_preference == RendererPreference::Auto)
+            .then(|| detect_compositor_gpu(&xcb_connection, screen))
+            .flatten();
 
         let xcb_connection = Rc::new(xcb_connection);
 
@@ -524,6 +527,7 @@ impl X11Client {
             pinch_scale: 1.0,
             gpu_context: Rc::new(RefCell::new(None)),
             compositor_gpu,
+            renderer_preference,
             scale_factor,
 
             xkb_context,
@@ -1609,6 +1613,7 @@ impl LinuxClient for X11Client {
         let scale_factor = state.scale_factor;
         let appearance = state.common.appearance;
         let compositor_gpu = state.compositor_gpu.take();
+        let renderer_preference = state.renderer_preference;
         let supports_xinput_gestures = state.supports_xinput_gestures;
         let is_bgr = state
             .resource_database
@@ -1620,6 +1625,7 @@ impl LinuxClient for X11Client {
             state.common.foreground_executor.clone(),
             state.gpu_context.clone(),
             compositor_gpu,
+            renderer_preference,
             params,
             &xcb_connection,
             client_side_decorations_supported,

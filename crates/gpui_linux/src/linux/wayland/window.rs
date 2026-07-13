@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::Context as _;
 use collections::{FxHashMap, HashMap};
 use futures::channel::oneshot::Receiver;
 
@@ -30,18 +31,18 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
-use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
+use crate::linux::{Globals, LinuxRenderer, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
-    WindowDecorations, WindowKind, WindowParams,
+    PromptButton, PromptLevel, RendererPreference, RenderingInfo, RequestFrameOptions, ResizeEdge,
+    Rgba, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowControls, WindowDecorations, WindowKind, WindowParams,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
+use gpui_wgpu::{CompositorGpuHint, WgpuSurfaceConfig, wgpu};
 
 #[derive(Default)]
 pub(crate) struct Callbacks {
@@ -63,6 +64,19 @@ struct RawWindow {
     display: *mut c_void,
 }
 
+impl RawWindow {
+    fn for_surface(surface: &wl_surface::WlSurface) -> anyhow::Result<Self> {
+        let backend = surface
+            .backend()
+            .upgrade()
+            .context("Wayland display was released before its window")?;
+        Ok(Self {
+            window: surface.id().as_ptr().cast::<c_void>(),
+            display: backend.display_ptr().cast::<c_void>(),
+        })
+    }
+}
+
 // Safety: The raw pointers in RawWindow point to Wayland surface/display
 // which are valid for the window's lifetime. These are used only for
 // passing to wgpu which needs Send+Sync for surface creation.
@@ -71,14 +85,14 @@ unsafe impl Sync for RawWindow {}
 
 impl rwh::HasWindowHandle for RawWindow {
     fn window_handle(&self) -> Result<rwh::WindowHandle<'_>, rwh::HandleError> {
-        let window = NonNull::new(self.window).unwrap();
+        let window = NonNull::new(self.window).ok_or(rwh::HandleError::Unavailable)?;
         let handle = rwh::WaylandWindowHandle::new(window);
         Ok(unsafe { rwh::WindowHandle::borrow_raw(handle.into()) })
     }
 }
 impl rwh::HasDisplayHandle for RawWindow {
     fn display_handle(&self) -> Result<rwh::DisplayHandle<'_>, rwh::HandleError> {
-        let display = NonNull::new(self.display).unwrap();
+        let display = NonNull::new(self.display).ok_or(rwh::HandleError::Unavailable)?;
         let handle = rwh::WaylandDisplayHandle::new(display);
         Ok(unsafe { rwh::DisplayHandle::borrow_raw(handle.into()) })
     }
@@ -108,7 +122,7 @@ pub struct WaylandWindowState {
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
     globals: Globals,
-    renderer: WgpuRenderer,
+    renderer: LinuxRenderer<RawWindow>,
     bounds: Bounds<Pixels>,
     scale: f32,
     input_handler: Option<PlatformInputHandler>,
@@ -549,29 +563,28 @@ impl WaylandWindowState {
         globals: Globals,
         gpu_context: gpui_wgpu::GpuContext,
         compositor_gpu: Option<CompositorGpuHint>,
+        renderer_preference: RendererPreference,
         options: WindowParams,
         parent: Option<WaylandWindowStatePtr>,
     ) -> anyhow::Result<Self> {
         let renderer = {
-            let raw_window = RawWindow {
-                window: surface.id().as_ptr().cast::<c_void>(),
-                display: surface
-                    .backend()
-                    .upgrade()
-                    .unwrap()
-                    .display_ptr()
-                    .cast::<c_void>(),
-            };
+            let raw_window = RawWindow::for_surface(&surface)?;
             let config = WgpuSurfaceConfig {
                 size: Size {
                     width: DevicePixels(f32::from(options.bounds.size.width) as i32),
                     height: DevicePixels(f32::from(options.bounds.size.height) as i32),
                 },
-                transparent: true,
+                transparent: renderer_preference != RendererPreference::Software,
                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
-            WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
+            LinuxRenderer::new(
+                gpu_context,
+                raw_window,
+                config,
+                compositor_gpu,
+                renderer_preference,
+            )?
         };
 
         if let WaylandSurfaceState::Xdg(ref xdg_state) = surface_state {
@@ -630,8 +643,9 @@ impl WaylandWindowState {
     }
 
     pub fn is_transparent(&self) -> bool {
-        self.decorations == WindowDecorations::Client
-            || self.background_appearance != WindowBackgroundAppearance::Opaque
+        !self.renderer.is_software()
+            && (self.decorations == WindowDecorations::Client
+                || self.background_appearance != WindowBackgroundAppearance::Opaque)
     }
 
     fn update_subpixel_layout(&mut self) {
@@ -740,6 +754,7 @@ impl WaylandWindow {
         globals: Globals,
         gpu_context: gpui_wgpu::GpuContext,
         compositor_gpu: Option<CompositorGpuHint>,
+        renderer_preference: RendererPreference,
         client: WaylandClientStatePtr,
         params: WindowParams,
         appearance: WindowAppearance,
@@ -777,6 +792,7 @@ impl WaylandWindow {
                 globals,
                 gpu_context,
                 compositor_gpu,
+                renderer_preference,
                 params,
                 parent,
             )?)),
@@ -1611,7 +1627,11 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut state = self.borrow_mut();
-        state.background_appearance = background_appearance;
+        state.background_appearance = if state.renderer.is_software() {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            background_appearance
+        };
         update_window(state);
     }
 
@@ -1620,13 +1640,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        let client = self.borrow().client.get_client();
-        let state = client.borrow();
-        state
-            .gpu_context
-            .borrow()
-            .as_ref()
-            .is_some_and(|ctx| ctx.supports_dual_source_blending())
+        self.borrow().renderer.supports_subpixel_rendering()
     }
 
     fn minimize(&self) {
@@ -1708,15 +1722,13 @@ impl PlatformWindow for WaylandWindow {
         let mut state = self.borrow_mut();
 
         if state.renderer.device_lost() {
-            let raw_window = RawWindow {
-                window: state.surface.id().as_ptr().cast::<std::ffi::c_void>(),
-                display: state
-                    .surface
-                    .backend()
-                    .upgrade()
-                    .unwrap()
-                    .display_ptr()
-                    .cast::<std::ffi::c_void>(),
+            let raw_window = match RawWindow::for_surface(&state.surface) {
+                Ok(raw_window) => raw_window,
+                Err(error) => {
+                    log::warn!("GPU recovery could not access the Wayland surface: {error:#}");
+                    state.force_render_after_recovery = true;
+                    return;
+                }
             };
             match state.renderer.recover(&raw_window) {
                 Ok(()) => {}
@@ -1729,7 +1741,25 @@ impl PlatformWindow for WaylandWindow {
             return;
         }
 
-        state.renderer_presented = state.renderer.draw(scene);
+        let size = state.bounds.to_device_pixels(state.scale).size;
+        let scale_factor = state.scale;
+        state.renderer_presented = match state.renderer.draw(
+            scene,
+            size,
+            scale_factor,
+            Rgba {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
+            },
+        ) {
+            Ok(presented) => presented,
+            Err(error) => {
+                log::error!("failed to draw Wayland window: {error:#}");
+                false
+            }
+        };
 
         if state.renderer.needs_redraw() {
             state.force_render_after_recovery = true;
@@ -1750,7 +1780,7 @@ impl PlatformWindow for WaylandWindow {
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let state = self.borrow();
-        state.renderer.sprite_atlas().clone()
+        state.renderer.sprite_atlas()
     }
 
     fn show_window_menu(&self, position: Point<Pixels>) {
@@ -1885,8 +1915,12 @@ impl PlatformWindow for WaylandWindow {
         state.client.update_ime_position(bounds);
     }
 
+    fn rendering_info(&self) -> RenderingInfo {
+        self.borrow().renderer.rendering_info()
+    }
+
     fn gpu_specs(&self) -> Option<GpuSpecs> {
-        self.borrow().renderer.gpu_specs().into()
+        self.rendering_info().gpu_specs
     }
 
     fn play_system_bell(&self) {

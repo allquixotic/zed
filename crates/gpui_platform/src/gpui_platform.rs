@@ -80,7 +80,7 @@ pub fn try_current_platform(options: PlatformOptions) -> gpui::Result<Rc<dyn Pla
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
-        Ok(gpui_linux::current_platform(options.headless))
+        gpui_linux::try_current_platform(options)
     }
 
     #[cfg(target_family = "wasm")]
