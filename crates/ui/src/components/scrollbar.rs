@@ -6,12 +6,12 @@ use std::{
 };
 
 use gpui::{
-    Along, Anchor, App, AppContext as _, Axis as ScrollbarAxis, BorderStyle, Bounds, ContentMask,
-    Context, Corners, CursorStyle, DispatchPhase, Div, Edges, Element, ElementId, Entity, EntityId,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, IsZero,
-    LayoutId, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Pixels, Point, Position, Render, ScrollHandle, ScrollWheelEvent, Size, Stateful,
-    StatefulInteractiveElement, Style, Styled, Task, UniformListDecoration,
+    Along, Anchor, AnimationPolicy, App, AppContext as _, Axis as ScrollbarAxis, BorderStyle,
+    Bounds, ContentMask, Context, Corners, CursorStyle, DispatchPhase, Div, Edges, Element,
+    ElementId, Entity, EntityId, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement,
+    IntoElement, IsZero, LayoutId, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point, Position, Render, ScrollHandle, ScrollWheelEvent,
+    Size, Stateful, StatefulInteractiveElement, Style, Styled, Task, UniformListDecoration,
     UniformListScrollHandle, Window, ease_in_out, prelude::FluentBuilder as _, px, quad, relative,
     size,
 };
@@ -1265,7 +1265,9 @@ impl<T: ScrollableHandle> Element for ScrollbarElement<T> {
                         animation_duration: delta_duration,
                         showing: should_invert,
                     } => {
-                        if cx.reduce_motion() {
+                        if cx.reduce_motion()
+                            || window.animation_policy() == AnimationPolicy::Reduced
+                        {
                             self.state.update(cx, |state, _| {
                                 let has_border = state
                                     .track_color

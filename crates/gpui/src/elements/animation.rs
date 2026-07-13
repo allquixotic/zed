@@ -2,8 +2,8 @@ use scheduler::Instant;
 use std::{rc::Rc, time::Duration};
 
 use crate::{
-    AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement,
-    ParentElement, Window,
+    AnimationPolicy, AnyElement, App, Element, ElementId, GlobalElementId, InspectorElementId,
+    IntoElement, ParentElement, Window,
 };
 
 pub use easing::*;
@@ -134,6 +134,16 @@ struct AnimationState {
     animation_ix: usize,
 }
 
+fn reduced_animation_frame(animations: &[Animation]) -> Option<(usize, f32)> {
+    let animation_ix = animations
+        .iter()
+        .position(|animation| !animation.oneshot)
+        .unwrap_or_else(|| animations.len().saturating_sub(1));
+    let animation = animations.get(animation_ix)?;
+    let delta = if animation.oneshot { 1.0 } else { 0.0 };
+    Some((animation_ix, (animation.easing)(delta)))
+}
+
 impl<E: IntoElement + 'static> Element for AnimationElement<E> {
     type RequestLayoutState = AnyElement;
     type PrepaintState = ();
@@ -153,6 +163,17 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         window: &mut Window,
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
+        if window.animation_policy() == AnimationPolicy::Reduced {
+            let element = self.element.take().expect("should only be called once");
+            let mut element =
+                if let Some((animation_ix, delta)) = reduced_animation_frame(&self.animations) {
+                    (self.animator)(element, animation_ix, delta).into_any_element()
+                } else {
+                    element.into_any_element()
+                };
+            return (element.request_layout(window, cx), element);
+        }
+
         window.with_element_state(global_id.unwrap(), |state, window| {
             let mut state = state.unwrap_or_else(|| AnimationState {
                 start: Instant::now(),
@@ -382,5 +403,21 @@ mod tests {
 
         assert_eq!(simulate_next_frame(&window, cx), 0);
         assert_eq!(*rendered_deltas.borrow(), vec![0.0]);
+    }
+
+    #[test]
+    fn reduced_animation_uses_final_oneshot_and_initial_repeating_frames() {
+        let oneshot = vec![
+            Animation::new(Duration::from_secs(1)),
+            Animation::new(Duration::from_secs(1)),
+        ];
+        assert_eq!(reduced_animation_frame(&oneshot), Some((1, 1.0)));
+
+        let repeating = vec![
+            Animation::new(Duration::from_secs(1)),
+            Animation::new(Duration::from_secs(1)).repeat(),
+        ];
+        assert_eq!(reduced_animation_frame(&repeating), Some((1, 0.0)));
+        assert_eq!(reduced_animation_frame(&[]), None);
     }
 }

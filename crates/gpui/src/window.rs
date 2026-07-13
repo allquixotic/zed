@@ -1,9 +1,9 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
 use crate::{
-    Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    Action, AnimationPolicy, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App,
+    AppContext, Arena, Asset, AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
@@ -991,6 +991,7 @@ pub struct Window {
     pub(crate) invalidator: WindowInvalidator,
     pub(crate) removed: bool,
     pub(crate) platform_window: Box<dyn PlatformWindow>,
+    rendering_info: RenderingInfo,
     display_id: Option<DisplayId>,
     sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
@@ -1343,6 +1344,7 @@ impl Window {
         }
 
         let display_id = platform_window.display().map(|display| display.id());
+        let rendering_info = platform_window.rendering_info();
         let sprite_atlas = platform_window.sprite_atlas();
         let mouse_position = platform_window.mouse_position();
         let modifiers = platform_window.modifiers();
@@ -1706,6 +1708,7 @@ impl Window {
             invalidator,
             removed: false,
             platform_window,
+            rendering_info,
             display_id,
             sprite_atlas,
             text_system,
@@ -5559,7 +5562,12 @@ impl Window {
 
     /// Read renderer selection and capability information for this window.
     pub fn rendering_info(&self) -> RenderingInfo {
-        self.platform_window.rendering_info()
+        self.rendering_info.clone()
+    }
+
+    /// Returns the animation policy selected by the active renderer.
+    pub fn animation_policy(&self) -> AnimationPolicy {
+        self.rendering_info.capabilities.animation_policy
     }
 
     /// Read information about the GPU backing this window.
