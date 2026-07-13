@@ -16,6 +16,7 @@ default = ["wayland", "x11"]
 test-support = ["gpui/test-support"]
 wayland = [
     "bitflags",
+    "gpui_cosmic_text",
     "gpui_wgpu",
     "ashpd/wayland",
 
@@ -32,6 +33,7 @@ wayland = [
     "gpui/wayland",
 ]
 x11 = [
+    "gpui_cosmic_text",
     "gpui_wgpu",
     "ashpd",
 
@@ -59,8 +61,9 @@ collections.workspace = true
 image.workspace = true
 futures.workspace = true
 gpui.workspace = true
+gpui_cosmic_text = { workspace = true, optional = true, features = ["font-kit"] }
 gpui_util.workspace = true
-gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
+gpui_wgpu = { workspace = true, optional = true }
 http_client.workspace = true
 itertools.workspace = true
 libc.workspace = true

@@ -67,9 +67,8 @@ impl WebPlatform {
         ));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher);
-        let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new_without_system_fonts(
-            "IBM Plex Sans",
-        ));
+        let text_system =
+            Arc::new(gpui_cosmic_text::CosmicTextSystem::new_without_system_fonts("IBM Plex Sans"));
         let fonts = BUNDLED_FONTS
             .iter()
             .map(|bytes| Cow::Borrowed(*bytes))

@@ -1,3 +1,5 @@
+//! CPU text shaping and glyph rasterization for GPUI.
+
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
