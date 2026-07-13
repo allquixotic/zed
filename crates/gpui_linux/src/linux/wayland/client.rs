@@ -98,8 +98,8 @@ use gpui::{
     ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection,
     Pixels, PlatformDisplay, PlatformInput, PlatformKeyboardLayout, PlatformWindow, Point,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, TouchPhase, WindowButtonLayout, WindowKind,
-    WindowParams, point, profiler, px, size,
+    RendererPreference, ScrollDelta, ScrollWheelEvent, SharedString, Size, TouchPhase,
+    WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -232,6 +232,7 @@ pub(crate) struct WaylandClientState {
     globals: Globals,
     pub gpu_context: GpuContext,
     pub compositor_gpu: Option<CompositorGpuHint>,
+    pub renderer_preference: RendererPreference,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
@@ -564,7 +565,7 @@ fn wl_output_version(version: u32) -> u32 {
 }
 
 impl WaylandClient {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(renderer_preference: RendererPreference) -> Self {
         let startup_activation_token = take_startup_activation_token_from_environment();
         let conn = Connection::connect_to_env().unwrap();
 
@@ -635,7 +636,9 @@ impl WaylandClient {
             )
             .unwrap();
 
-        let compositor_gpu = detect_compositor_gpu();
+        let compositor_gpu = (renderer_preference == RendererPreference::Auto)
+            .then(detect_compositor_gpu)
+            .flatten();
         let gpu_context = Rc::new(RefCell::new(None));
 
         let seat = seat.unwrap();
@@ -706,6 +709,7 @@ impl WaylandClient {
             globals,
             gpu_context,
             compositor_gpu,
+            renderer_preference,
             wl_seat: seat,
             wl_pointer: None,
             wl_keyboard: None,
@@ -883,12 +887,14 @@ impl LinuxClient for WaylandClient {
 
         let appearance = state.common.appearance;
         let compositor_gpu = state.compositor_gpu.take();
+        let renderer_preference = state.renderer_preference;
 
         let (window, surface_id) = WaylandWindow::new(
             handle,
             state.globals.clone(),
             state.gpu_context.clone(),
             compositor_gpu,
+            renderer_preference,
             WaylandClientStatePtr(Rc::downgrade(&self.0)),
             params,
             appearance,
