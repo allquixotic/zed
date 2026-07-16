@@ -131,6 +131,10 @@ Your AWS credentials need these permissions:
 
 - `bedrock:InvokeModelWithResponseStream`
 - `bedrock:InvokeModel`
+- `bedrock:ListFoundationModels`
+- `bedrock:ListInferenceProfiles`
+
+The two list permissions let Zed populate the model picker with the models and inference profiles available to your AWS account. If model discovery is not permitted, Zed keeps its built-in and configured models available and shows the discovery error in Agent Settings.
 
 Bedrock supports Zed-prefixed AWS environment variables so Zed does not override or consume your normal AWS credentials:
 
@@ -144,7 +148,16 @@ Bedrock supports Zed-prefixed AWS environment variables so Zed does not override
 
 ### Bedrock Authentication {#bedrock-authentication}
 
-You can authenticate with a named profile, static credentials, or a Bedrock API key.
+Open Agent Settings with {#action agent::OpenSettings} and select Amazon Bedrock. You can choose:
+
+- **Automatic (AWS credential chain)** to use the standard AWS SDK credential chain, including environment, container, and instance credentials.
+- **AWS profile** to select a named profile loaded from your local AWS config and credentials files.
+- **AWS SSO profile** to select an IAM Identity Center profile and use the AWS SDK's SSO credential provider and refresh behavior.
+- **Static credentials or API key** to store an access key pair, temporary IAM credentials, or a Bedrock API key in the system keychain.
+
+Select an AWS Region in the same view. Zed uses that Region for Bedrock Runtime and Mantle model discovery, shows the status of both catalogs, and lets you retry a failed discovery. `ZED_AWS_REGION` overrides the selector until the environment variable is unset and Zed is restarted.
+
+The controls write the same settings available in `settings.json`. For example, a named profile uses:
 
 For a named profile, configure Bedrock in settings:
 
@@ -160,9 +173,9 @@ For a named profile, configure Bedrock in settings:
 }
 ```
 
-For static credentials, open Agent Settings with {#action agent::OpenSettings}, go to the Amazon Bedrock section, and enter the access key ID, secret access key, and region.
+Use `"authentication_method": "sso"` for an SSO profile, `"default"` for the automatic credential chain, or `"api_key"` for credentials stored in the keychain.
 
-For a Bedrock API key, choose API key authentication:
+For a Bedrock API key, choose **Static credentials or API key**, then enter the key in the Bedrock API Key field. The equivalent settings are:
 
 ```json [settings]
 {
@@ -175,7 +188,7 @@ For a Bedrock API key, choose API key authentication:
 }
 ```
 
-The API key itself is stored in the system keychain, not in `settings.json`.
+The API key itself is stored in the system keychain, not in `settings.json`. AWS profiles remain in the normal AWS config files; Zed stores only the selected profile name.
 
 ### Bedrock Cross-Region Inference {#bedrock-cross-region-inference}
 
@@ -215,9 +228,13 @@ Some AWS environments require a guardrail on every Bedrock API call. Add `guardr
 
 ### Bedrock Mantle Models {#bedrock-mantle-models}
 
-Some models, such as the GPT-5.6 family (Sol, Terra, and Luna), GPT-5.5, GPT-5.4, and Grok 4.3, aren't available through Bedrock's Converse API and are only reachable through `bedrock-mantle`, AWS's OpenAI-compatible inference endpoint. Zed routes these models through `bedrock-mantle` automatically; they appear alongside the rest of the Bedrock models in the model picker once you're authenticated, with no extra configuration required.
+Some models, such as the GPT-5.6 family (Sol, Terra, and Luna), GPT-5.5, GPT-5.4, and Grok 4.3, aren't available through Bedrock's Converse API and are only reachable through `bedrock-mantle`. Mantle exposes OpenAI Responses and Chat Completions APIs as well as Anthropic's Messages API. Zed routes each discovered model through its supported protocol automatically, including current Mantle Claude models, and shows the result in the normal model picker without requiring a model ID or ARN.
 
-Mantle models require IAM permissions for the `bedrock-mantle` endpoint (for example via the `AmazonBedrockMantleInferenceAccess` managed policy) in addition to whatever permissions your existing Bedrock credentials already have, and `bedrock-mantle` is only available in [some AWS Regions](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html#regions). Zed surfaces an error naming the current Region and the supported ones if you try to use a Mantle model outside of them.
+Mantle models require IAM permissions for the `bedrock-mantle` endpoint (for example via the [`AmazonBedrockMantleInferenceAccess`](https://docs.aws.amazon.com/aws-managed-policy/latest/reference/AmazonBedrockMantleInferenceAccess.html) managed policy) in addition to whatever permissions your existing Bedrock credentials already have. Model discovery uses `bedrock-mantle:ListModels`. Bedrock API keys require `bedrock-mantle:CallWithBearerToken` for Mantle requests.
+
+`bedrock-mantle` is only available in [some AWS Regions](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html#regions). When the selected Region does not support Mantle, Zed disables only the Mantle catalog and keeps Bedrock Runtime models available. If either catalog request fails, built-in and explicitly configured models remain usable.
+
+Claude Mythos 5 and Claude Fable 5 require the AWS account's data retention mode to be set to `provider_data_share` before they can be used. Review [Amazon Bedrock's data retention documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html) before opting in; AWS documents that prompts and completions for these models are shared with Anthropic and may be retained for trust and safety purposes.
 
 #### Custom Bedrock Mantle Models {#bedrock-mantle-custom-models}
 
@@ -243,7 +260,7 @@ You can add custom models served through `bedrock-mantle` with `mantle_available
 }
 ```
 
-`protocol` selects which OpenAI-compatible API the model is called through, and must be either `chat_completions` or `responses`. Set `supports_thinking` to `true` for custom Mantle models that accept OpenAI reasoning effort parameters; Zed will then expose `low`, `medium`, `high`, and `xhigh` in the thinking effort picker, while disabling thinking sends `none`.
+`protocol` selects the API used for the model and must be `chat_completions`, `responses`, or `anthropic_messages`. Set `supports_thinking` to `true` for custom Mantle models that accept reasoning effort parameters; Zed will then expose `low`, `medium`, `high`, and `xhigh` in the thinking effort picker, while disabling thinking sends `none`.
 
 ## OpenAI-Compatible Gateways {#openai-compatible}
 
