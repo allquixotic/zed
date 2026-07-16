@@ -118,7 +118,7 @@ use {
         any::Any,
         path::{Path, PathBuf},
         rc::Rc,
-        sync::Arc,
+        sync::{Arc, OnceLock},
         time::Duration,
     },
     util::ResultExt as _,
@@ -147,6 +147,9 @@ mod constants {
 
 #[cfg(target_os = "macos")]
 use constants::*;
+
+#[cfg(target_os = "macos")]
+static ACTIVE_VISUAL_TEST_RENDERER: OnceLock<RendererBackend> = OnceLock::new();
 
 #[cfg(target_os = "macos")]
 fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> {
@@ -297,10 +300,12 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
 
     cx.run_until_parked();
 
+    let rendering_info = workspace_window
+        .update(&mut cx, |_, window, _| window.rendering_info())
+        .context("Failed to read visual test renderer status")?;
+    ACTIVE_VISUAL_TEST_RENDERER.get_or_init(|| rendering_info.active_backend);
+
     if visual_test_renderer_preference() == RendererPreference::Software {
-        let rendering_info = workspace_window
-            .update(&mut cx, |_, window, _| window.rendering_info())
-            .context("Failed to read visual test renderer status")?;
         anyhow::ensure!(
             rendering_info.active_backend == RendererBackend::Software,
             "software visual test selected {:?}",
@@ -786,10 +791,18 @@ fn get_baseline_path(test_name: &str) -> PathBuf {
     let baseline_dir = std::env::var_os("VISUAL_TEST_BASELINE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            workspace_root.join(match visual_test_renderer_preference() {
-                RendererPreference::Auto => HARDWARE_BASELINE_DIR,
-                RendererPreference::Software => SOFTWARE_BASELINE_DIR,
-            })
+            workspace_root.join(
+                match ACTIVE_VISUAL_TEST_RENDERER
+                    .get()
+                    .copied()
+                    .unwrap_or_else(|| match visual_test_renderer_preference() {
+                        RendererPreference::Auto => RendererBackend::Hardware,
+                        RendererPreference::Software => RendererBackend::Software,
+                    }) {
+                    RendererBackend::Hardware => HARDWARE_BASELINE_DIR,
+                    RendererBackend::Software => SOFTWARE_BASELINE_DIR,
+                },
+            )
         });
 
     baseline_dir.join(format!("{}.png", test_name))

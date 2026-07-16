@@ -141,7 +141,7 @@ Zed uses [Vulkan](https://www.vulkan.org/) for hardware-accelerated rendering. I
 
 You can also select **Software (CPU)** under **Settings → Window & Layout → Window → Rendering Backend**. Restart Zed to apply the change. To set it directly in your user settings, add this root-level setting:
 
-```json
+```json [settings]
 {
   "rendering_backend": "software"
 }

@@ -699,19 +699,68 @@ impl SoftwareRasterizer {
 
     fn fill_checkerboard(&mut self, bounds: RectData, color: ColorData, size: f32) -> Result<()> {
         let size = f64::from(size);
-        if size <= 0.0 {
+        if !size.is_finite() || size <= 0.0 {
             return Ok(());
         }
         let edges = bounds.edges();
-        let mut row = 0usize;
-        let mut y = edges[1];
-        while y < edges[3] {
-            let mut column = 0usize;
-            let mut x = edges[0];
-            while x < edges[2] {
+        let tile_left = self.tile_origin[0] as f64;
+        let tile_top = self.tile_origin[1] as f64;
+        let tile_right = tile_left + f64::from(self.size[0]);
+        let tile_bottom = tile_top + f64::from(self.size[1]);
+        let left = edges[0].max(tile_left);
+        let top = edges[1].max(tile_top);
+        let right = edges[2].min(tile_right);
+        let bottom = edges[3].min(tile_bottom);
+        if left >= right || top >= bottom {
+            return Ok(());
+        }
+        if size < 1.0 {
+            for local_y in 0..self.size[1] {
+                let y = tile_top + f64::from(local_y);
+                let center_y = y + 0.5;
+                if center_y < top || center_y >= bottom {
+                    continue;
+                }
+                let row = checker_index_parity(center_y, edges[1], size);
+                for local_x in 0..self.size[0] {
+                    let x = tile_left + f64::from(local_x);
+                    let center_x = x + 0.5;
+                    if center_x < left || center_x >= right {
+                        continue;
+                    }
+                    let column = checker_index_parity(center_x, edges[0], size);
+                    if (row + column) % 2 == 1 {
+                        self.fill_vello_rect(
+                            Rect::new(
+                                x.max(left),
+                                y.max(top),
+                                (x + 1.0).min(right),
+                                (y + 1.0).min(bottom),
+                            ),
+                            color.get(),
+                        )?;
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let column_offset = ((left - edges[0]) / size).floor();
+        let row_offset = ((top - edges[1]) / size).floor();
+        let mut row = row_offset.rem_euclid(2.0) as usize;
+        let mut y = left_aligned_pattern_origin(top, edges[1], size);
+        while y < bottom {
+            let mut column = column_offset.rem_euclid(2.0) as usize;
+            let mut x = left_aligned_pattern_origin(left, edges[0], size);
+            while x < right {
                 if (row + column) % 2 == 1 {
                     self.fill_vello_rect(
-                        Rect::new(x, y, (x + size).min(edges[2]), (y + size).min(edges[3])),
+                        Rect::new(
+                            x.max(left),
+                            y.max(top),
+                            (x + size).min(right),
+                            (y + size).min(bottom),
+                        ),
                         color.get(),
                     )?;
                 }
@@ -1041,6 +1090,19 @@ impl InverseTransform {
 
 fn float_bits(value: f32) -> crate::software_scene::FloatBits {
     crate::software_scene::FloatBits::from_bits(value.to_bits())
+}
+
+fn checker_index_parity(coordinate: f64, origin: f64, size: f64) -> usize {
+    let index = ((coordinate - origin) / size).floor();
+    if index.is_finite() {
+        index.rem_euclid(2.0) as usize
+    } else {
+        0
+    }
+}
+
+fn left_aligned_pattern_origin(clip_start: f64, bounds_start: f64, size: f64) -> f64 {
+    clip_start - (clip_start - bounds_start).rem_euclid(size)
 }
 
 fn tile_transform(tile_origin: [usize; 2]) -> Result<Affine> {
@@ -1468,6 +1530,64 @@ mod tests {
         assert_eq!(target.pixmap.data()[0].r, 255);
         assert_eq!(target.pixmap.data()[0].g, 255);
         assert!(target.pixmap.data()[0].b < 255);
+        Ok(())
+    }
+
+    #[test]
+    fn checkerboard_clips_extreme_bounds_and_tiny_cells() -> Result<()> {
+        let mut rasterizer = SoftwareRasterizer::new();
+        rasterizer.begin_tile(
+            [4, 4],
+            [100, 100],
+            color(0.0, 0.0, 0.0),
+            SoftwareTextRenderingParams::default(),
+        )?;
+        rasterizer.fill_checkerboard(
+            RectData::new(
+                -1.0e20,
+                -1.0e20,
+                2.0e20,
+                2.0e20,
+                "extreme checkerboard bounds",
+            )?,
+            ColorData::from_rgba(color(1.0, 1.0, 1.0))?,
+            f32::MIN_POSITIVE,
+        )?;
+        assert_eq!(rasterizer.finish()?.len(), 16);
+        Ok(())
+    }
+
+    #[test]
+    fn subpixel_checkerboard_keeps_phase_across_tiles() -> Result<()> {
+        let bounds = RectData::new(0.0, 0.0, 8.0, 1.0, "subpixel checkerboard bounds")?;
+        let foreground = ColorData::from_rgba(color(1.0, 1.0, 1.0))?;
+
+        let mut full = SoftwareRasterizer::new();
+        full.begin([8, 1], color(0.0, 0.0, 0.0))?;
+        full.fill_checkerboard(bounds, foreground, 0.75)?;
+        let full = full.finish()?.to_vec();
+
+        let mut left = SoftwareRasterizer::new();
+        left.begin_tile(
+            [4, 1],
+            [0, 0],
+            color(0.0, 0.0, 0.0),
+            SoftwareTextRenderingParams::default(),
+        )?;
+        left.fill_checkerboard(bounds, foreground, 0.75)?;
+        let mut tiled = left.finish()?.to_vec();
+
+        let mut right = SoftwareRasterizer::new();
+        right.begin_tile(
+            [4, 1],
+            [4, 0],
+            color(0.0, 0.0, 0.0),
+            SoftwareTextRenderingParams::default(),
+        )?;
+        right.fill_checkerboard(bounds, foreground, 0.75)?;
+        tiled.extend_from_slice(right.finish()?);
+
+        assert_eq!(tiled, full);
         Ok(())
     }
 

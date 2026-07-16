@@ -983,8 +983,8 @@ mod tests {
         path.set_stroke(PathStroke {
             width: 8.0,
             ..PathStroke::default()
-        });
-        let mut path = path.scale(1.0);
+        })?;
+        let mut path = path.scale(1.0)?;
         path.content_mask = ContentMask {
             bounds: bounds(0.0, 0.0, 128.0, 64.0),
         };

@@ -358,7 +358,7 @@ fn main() {
         Ok(application) => application.with_assets(Assets),
         Err(error) => {
             eprintln!("Zed failed to initialize its platform: {error:#}");
-            return;
+            process::exit(1);
         }
     };
 

@@ -136,7 +136,7 @@ Zed normally uses Metal for rendering. If Metal cannot be initialized, Zed autom
 
 To use CPU rendering deliberately, select **Software (CPU)** under **Settings → Window & Layout → Window → Rendering Backend**, then restart Zed. You can also add this root-level user setting:
 
-```json
+```json [settings]
 {
   "rendering_backend": "software"
 }

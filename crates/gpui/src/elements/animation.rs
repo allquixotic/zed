@@ -135,13 +135,20 @@ struct AnimationState {
 }
 
 fn reduced_animation_frame(animations: &[Animation]) -> Option<(usize, f32)> {
-    let animation_ix = animations
-        .iter()
-        .position(|animation| !animation.oneshot)
-        .unwrap_or_else(|| animations.len().saturating_sub(1));
+    let animation_ix = animations.len().checked_sub(1)?;
     let animation = animations.get(animation_ix)?;
-    let delta = if animation.oneshot { 1.0 } else { 0.0 };
-    Some((animation_ix, (animation.easing)(delta)))
+    Some((animation_ix, (animation.easing)(1.0)))
+}
+
+fn initial_animation_ix(animations: &[Animation], policy: AnimationPolicy) -> usize {
+    if policy == AnimationPolicy::Reduced {
+        animations
+            .iter()
+            .position(|animation| !animation.oneshot)
+            .unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 impl<E: IntoElement + 'static> Element for AnimationElement<E> {
@@ -163,7 +170,10 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         window: &mut Window,
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
-        if window.animation_policy() == AnimationPolicy::Reduced {
+        let animation_policy = window.animation_policy();
+        if animation_policy == AnimationPolicy::Reduced
+            && self.animations.iter().all(|animation| animation.oneshot)
+        {
             let element = self.element.take().expect("should only be called once");
             let mut element =
                 if let Some((animation_ix, delta)) = reduced_animation_frame(&self.animations) {
@@ -177,7 +187,7 @@ impl<E: IntoElement + 'static> Element for AnimationElement<E> {
         window.with_element_state(global_id.unwrap(), |state, window| {
             let mut state = state.unwrap_or_else(|| AnimationState {
                 start: Instant::now(),
-                animation_ix: 0,
+                animation_ix: initial_animation_ix(&self.animations, animation_policy),
             });
             let (animation_ix, delta, done) = if cx.reduce_motion() {
                 let animation_ix = self.animations.len() - 1;
@@ -406,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn reduced_animation_uses_final_oneshot_and_initial_repeating_frames() {
+    fn reduced_animation_skips_oneshots_before_repeating_animation() {
         let oneshot = vec![
             Animation::new(Duration::from_secs(1)),
             Animation::new(Duration::from_secs(1)),
@@ -417,7 +427,10 @@ mod tests {
             Animation::new(Duration::from_secs(1)),
             Animation::new(Duration::from_secs(1)).repeat(),
         ];
-        assert_eq!(reduced_animation_frame(&repeating), Some((1, 0.0)));
+        assert_eq!(
+            initial_animation_ix(&repeating, AnimationPolicy::Reduced),
+            1
+        );
         assert_eq!(reduced_animation_frame(&[]), None);
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use bedrock::{
     BedrockToolResultContentBlock, BedrockToolResultStatus, BedrockToolSpec, BedrockToolUseBlock,
     ConverseModel, MantleModel, MantleProtocol, value_to_aws_document,
 };
-use collections::{BTreeMap, HashMap};
+use collections::{BTreeMap, HashMap, HashSet};
 use credentials_provider::CredentialsProvider;
 use fs::Fs;
 use futures::{
@@ -691,6 +692,18 @@ async fn discover_runtime_targets(
                 right.display_name.as_str(),
             ))
     });
+
+    let mut assigned_stable_ids = HashSet::default();
+    for target in &mut targets {
+        let Some(model) = ConverseModel::from_request_id(&target.base_model_id) else {
+            continue;
+        };
+        let stable_id = model.id().to_string();
+        if assigned_stable_ids.insert(stable_id.clone()) {
+            target.id = stable_id;
+        }
+    }
+
     Ok(targets)
 }
 
@@ -1146,11 +1159,15 @@ impl State {
 
     /// Resolve authentication. Settings take priority over UX-provided credentials.
     fn authenticate_with_invalidation(
-        &self,
+        &mut self,
         invalidate_session: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), AuthenticateError>> {
         if self.is_authenticated() {
+            if invalidate_session {
+                self.aws_session_cache.invalidate();
+                self.reset_discovery();
+            }
             return Task::ready(Ok(()));
         }
         let configuration_revision = self.configuration_revision;
@@ -1322,7 +1339,7 @@ impl State {
     }
 
     fn authenticate_and_refresh(
-        &self,
+        &mut self,
         invalidate_session: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), AuthenticateError>> {
@@ -1463,7 +1480,6 @@ impl BedrockLanguageModelProvider {
             .runtime_targets
             .iter()
             .find(|target| target.base_model_id == base_model_id)
-            .or_else(|| state.runtime_targets.first())
             .cloned()?;
         Some(self.create_language_model(target.into_converse_model()))
     }
@@ -2156,18 +2172,37 @@ impl MantleResponseEventMapper {
     }
 
     fn map_stream(
-        mut self,
+        self,
         events: BoxStream<'static, Result<OpenAiResponseStreamEvent>>,
     ) -> BoxStream<'static, Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
     {
-        events
-            .flat_map(move |event| {
-                futures::stream::iter(match event {
-                    Ok(event) => self.map_event(event),
-                    Err(error) => vec![Err(LanguageModelCompletionError::from(error))],
-                })
-            })
-            .boxed()
+        futures::stream::unfold(
+            (self, events, VecDeque::new(), false),
+            |(mut mapper, mut events, mut pending, mut finished)| async move {
+                loop {
+                    if let Some(event) = pending.pop_front() {
+                        return Some((event, (mapper, events, pending, finished)));
+                    }
+                    if finished {
+                        return None;
+                    }
+
+                    match events.next().await {
+                        Some(Ok(event)) => pending.extend(mapper.map_event(event)),
+                        Some(Err(error)) => {
+                            pending.extend(mapper.finish_current_message());
+                            pending.push_back(Err(LanguageModelCompletionError::from(error)));
+                            finished = true;
+                        }
+                        None => {
+                            pending.extend(mapper.finish_current_message());
+                            finished = true;
+                        }
+                    }
+                }
+            },
+        )
+        .boxed()
     }
 
     fn map_event(
@@ -4505,7 +4540,12 @@ mod tests {
 
         assert_eq!(targets.len(), 3);
         assert_eq!(targets[0].kind, BedrockTargetKind::FoundationModel);
+        assert_eq!(targets[0].id, "claude-sonnet-4-5");
         assert_eq!(targets[1].kind, BedrockTargetKind::SystemInferenceProfile);
+        assert_eq!(
+            targets[1].id,
+            "bedrock-runtime:profile:us.anthropic.claude-sonnet-4-5-v1:0"
+        );
         assert_eq!(
             targets[2].kind,
             BedrockTargetKind::ApplicationInferenceProfile
@@ -5090,6 +5130,48 @@ mod tests {
                 LanguageModelCompletionEvent::Text("Plan: rename".to_string()),
                 LanguageModelCompletionEvent::Text(" and regenerate".to_string()),
                 LanguageModelCompletionEvent::Stop(language_model::StopReason::EndTurn),
+            ]
+        );
+    }
+
+    #[test]
+    fn mantle_response_mapper_flushes_undetermined_message_at_eof() {
+        let first_message = mantle_message_item("msg_1");
+        let second_message = mantle_message_item("msg_2");
+        let input = vec![
+            item_added(0, first_message.clone()),
+            text_delta("msg_1", 0, "Plan"),
+            item_done(0, first_message),
+            item_added(1, second_message),
+            text_delta("msg_2", 1, "Plan"),
+        ];
+
+        let events = futures::executor::block_on(async {
+            MantleResponseEventMapper::new()
+                .map_stream(
+                    futures::stream::iter(input.into_iter().map(Ok::<_, anyhow::Error>)).boxed(),
+                )
+                .collect::<Vec<_>>()
+                .await
+        });
+        let events = start_messages_and_texts(
+            events
+                .into_iter()
+                .map(|event| event.expect("Mantle response event should map successfully"))
+                .collect(),
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                LanguageModelCompletionEvent::StartMessage {
+                    message_id: "msg_1".to_string(),
+                },
+                LanguageModelCompletionEvent::Text("Plan".to_string()),
+                LanguageModelCompletionEvent::StartMessage {
+                    message_id: "msg_2".to_string(),
+                },
+                LanguageModelCompletionEvent::Text("Plan".to_string()),
             ]
         );
     }

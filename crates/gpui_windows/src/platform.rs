@@ -66,7 +66,7 @@ pub(crate) struct WindowsPlatformState {
     pub(crate) current_cursor: Cell<Option<HCURSOR>>,
     /// Shared with each window so `WM_SETCURSOR` can read it directly.
     pub(crate) cursor_visible: Arc<AtomicBool>,
-    directx_devices: RefCell<Option<DirectXDevices>>,
+    directx_devices: Arc<RwLock<Option<DirectXDevices>>>,
     directx_initialization_error: RefCell<Option<CachedHardwareRendererInitializationError>>,
 }
 
@@ -93,7 +93,7 @@ impl WindowsPlatformState {
             jump_list: RefCell::new(jump_list),
             current_cursor: Cell::new(current_cursor),
             cursor_visible: Arc::new(AtomicBool::new(true)),
-            directx_devices: RefCell::new(None),
+            directx_devices: Arc::new(RwLock::new(None)),
             directx_initialization_error: RefCell::new(None),
             menus: RefCell::new(Vec::new()),
         }
@@ -102,7 +102,7 @@ impl WindowsPlatformState {
     fn directx_devices(
         &self,
     ) -> std::result::Result<DirectXDevices, CachedHardwareRendererInitializationError> {
-        if let Some(devices) = self.directx_devices.borrow().clone() {
+        if let Some(devices) = self.directx_devices.read().clone() {
             return Ok(devices);
         }
         if let Some(error) = self.directx_initialization_error.borrow().clone() {
@@ -110,7 +110,7 @@ impl WindowsPlatformState {
         }
         match DirectXDevices::new_categorized() {
             Ok(devices) => {
-                *self.directx_devices.borrow_mut() = Some(devices.clone());
+                *self.directx_devices.write() = Some(devices.clone());
                 Ok(devices)
             }
             Err(error) => {
@@ -325,7 +325,7 @@ impl WindowsPlatform {
     }
 
     fn begin_vsync_thread(&self) {
-        let mut directx_device = self.inner.state.directx_devices.borrow().clone();
+        let directx_devices = self.inner.state.directx_devices.clone();
         let platform_window: SafeHwnd = self.handle.into();
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
@@ -337,6 +337,7 @@ impl WindowsPlatform {
                 let vsync_provider = VSyncProvider::new();
                 loop {
                     vsync_provider.wait_for_vsync();
+                    let mut directx_device = directx_devices.read().clone();
                     if let Some(directx_device) = directx_device.as_mut()
                         && (check_device_lost(&directx_device.device)
                             || invalidate_devices.fetch_and(false, Ordering::Acquire))
@@ -1085,8 +1086,7 @@ impl WindowsPlatformInner {
     fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
         let directx_devices = lparam.0 as *const DirectXDevices;
         let directx_devices = unsafe { &*directx_devices };
-        self.state.directx_devices.borrow_mut().take();
-        *self.state.directx_devices.borrow_mut() = Some(directx_devices.clone());
+        *self.state.directx_devices.write() = Some(directx_devices.clone());
         self.state.directx_initialization_error.borrow_mut().take();
 
         Some(0)

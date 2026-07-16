@@ -8,8 +8,6 @@ use futures::{StreamExt, channel::mpsc};
 use gpui::{App, BackgroundExecutor, ReadGlobal, RendererPreference};
 use std::{io, path::Path, path::PathBuf, sync::Arc, time::Duration};
 
-use crate::settings_content::RootUserSettings;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -34,6 +32,12 @@ mod tests {
         assert_eq!(
             renderer_preference_from_user_settings_result(Ok(
                 r#"{ "rendering_backend": "software" }"#.to_string()
+            )),
+            RendererPreference::Software
+        );
+        assert_eq!(
+            renderer_preference_from_user_settings_result(Ok(
+                r#"{ "rendering_backend": "software", "ui_font_size": "invalid" }"#.to_string()
             )),
             RendererPreference::Software
         );
@@ -142,6 +146,12 @@ mod tests {
 
 pub const EMPTY_THEME_NAME: &str = "empty-theme";
 
+#[derive(serde::Deserialize)]
+struct RendererPreferenceSettings {
+    #[serde(default)]
+    rendering_backend: Option<RendererPreference>,
+}
+
 pub fn renderer_preference_from_user_settings_file(path: &Path) -> RendererPreference {
     renderer_preference_from_user_settings_result(std::fs::read_to_string(path))
 }
@@ -151,7 +161,9 @@ fn renderer_preference_from_user_settings_result(
 ) -> RendererPreference {
     let preference = settings_text
         .map_err(anyhow::Error::from)
-        .and_then(|settings_text| UserSettingsContent::parse_json_with_comments(&settings_text))
+        .and_then(|settings_text| {
+            crate::parse_json_with_comments::<RendererPreferenceSettings>(&settings_text)
+        })
         .map(|settings| settings.rendering_backend.unwrap_or_default());
 
     match preference {

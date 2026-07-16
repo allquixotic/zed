@@ -234,7 +234,7 @@ Mantle models require IAM permissions for the `bedrock-mantle` endpoint (for exa
 
 `bedrock-mantle` is only available in [some AWS Regions](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html#regions). When the selected Region does not support Mantle, Zed disables only the Mantle catalog and keeps Bedrock Runtime models available. If either catalog request fails, built-in and explicitly configured models remain usable.
 
-Claude Mythos 5 and Claude Fable 5 require the AWS account's data retention mode to be set to `provider_data_share` before they can be used. Review [Amazon Bedrock's data retention documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html) before opting in; AWS documents that prompts and completions for these models are shared with Anthropic and may be retained for trust and safety purposes.
+Claude Mythos 5 and Claude Fable 5 require the AWS account's data retention mode to be set to `provider_data_share` before they can be used. Review [Amazon Bedrock's data retention documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html) before opting in; AWS documents that prompts and completions for these models are shared with Anthropic and retained for up to 30 days for trust and safety purposes.
 
 #### Custom Bedrock Mantle Models {#bedrock-mantle-custom-models}
 
@@ -260,7 +260,7 @@ You can add custom models served through `bedrock-mantle` with `mantle_available
 }
 ```
 
-`protocol` selects the API used for the model and must be `chat_completions`, `responses`, or `anthropic_messages`. Set `supports_thinking` to `true` for custom Mantle models that accept reasoning effort parameters; Zed will then expose `low`, `medium`, `high`, and `xhigh` in the thinking effort picker, while disabling thinking sends `none`.
+`protocol` selects the API used for the model and must be `chat_completions`, `responses`, or `anthropic_messages`. Set `supports_thinking` to `true` for custom Mantle models that accept reasoning effort parameters; Zed then exposes `low`, `medium`, `high`, and `xhigh` in the thinking effort picker. Disabling thinking sends `none` for OpenAI-compatible protocols and omits thinking parameters for Anthropic Messages.
 
 ## OpenAI-Compatible Gateways {#openai-compatible}
 

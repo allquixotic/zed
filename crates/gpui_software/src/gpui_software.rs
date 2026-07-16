@@ -915,7 +915,7 @@ mod tests {
         canonical.close();
         canonical.color = solid_background(Hsla::red());
         canonical.content_mask = path_mask;
-        let mut canonical = canonical.scale(1.0);
+        let mut canonical = canonical.scale(1.0)?;
         canonical.order = 2;
         scene.paths.push(canonical);
 
@@ -928,10 +928,10 @@ mod tests {
         stroke.set_stroke(PathStroke {
             width: 2.0,
             ..PathStroke::default()
-        });
+        })?;
         stroke.color = solid_background(Hsla::blue());
         stroke.content_mask = path_mask;
-        let mut stroke = stroke.scale(1.0);
+        let mut stroke = stroke.scale(1.0)?;
         stroke.order = 3;
         scene.paths.push(stroke);
 
@@ -950,7 +950,7 @@ mod tests {
         );
         triangles.color = solid_background(Hsla::blue());
         triangles.content_mask = path_mask;
-        let mut triangles = triangles.scale(1.0);
+        let mut triangles = triangles.scale(1.0)?;
         triangles.order = 4;
         scene.paths.push(triangles);
 

@@ -989,12 +989,12 @@ impl MacWindow {
             // From winit crate: On Mojave, views automatically become layer-backed shortly after
             // being added to a native_window. Changing the layer-backedness of a view breaks the
             // association between the view and its associated OpenGL context. To work around this,
-            // on we explicitly make the view layer-backed up front so that AppKit doesn't do it
-            // itself and break the association with its context.
+            // we explicitly make the view layer-backed up front so that AppKit doesn't do it itself
+            // and break the association with its context.
             native_view.setWantsLayer(YES);
             let _: () = msg_send![
-            native_view,
-            setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize
+                native_view,
+                setLayerContentsRedrawPolicy: NSViewLayerContentsRedrawDuringViewResize
             ];
 
             content_view.addSubview_(native_view.autorelease());

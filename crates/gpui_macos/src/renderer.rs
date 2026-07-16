@@ -1,6 +1,6 @@
 use crate::metal_renderer;
 use anyhow::{Context as _, Result, ensure};
-use cocoa::base::{id, nil};
+use cocoa::base::{YES, id, nil};
 use gpui::{
     CachedHardwareRendererInitializationError, DevicePixels, HardwareRendererInitializationError,
     PlatformAtlas, RendererFallbackReason, RendererPreference, RendererSelection, RenderingInfo,
@@ -117,6 +117,9 @@ pub(crate) unsafe fn new_renderer(
             Ok((renderer, Some(gpu_specs)))
         },
         || {
+            unsafe {
+                let _: () = msg_send![native_view as id, setWantsLayer: YES];
+            }
             let view = NonNull::new(native_view).context("AppKit software view is null")?;
             let window = AppKitWindow { view };
             let presenter = SoftwarePresenter::new(window, window)

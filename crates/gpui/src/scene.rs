@@ -5,8 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, FillOptions,
+    FillRule, Hsla, PathBuilder, PathStyle, Pixels, Point, Radians, ScaledPixels, Size,
+    StrokeOptions, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -801,6 +802,7 @@ pub struct Path<P: Clone + Debug + Default + PartialEq> {
     pub color: Background,
     commands: Vec<PathCommand<P>>,
     paint: PathPaint,
+    uses_canonical_paint: bool,
     has_triangle_fallback: bool,
     start: Point<P>,
     current: Point<P>,
@@ -900,19 +902,26 @@ impl Path<Pixels> {
             color: Default::default(),
             commands: vec![PathCommand::MoveTo(start)],
             paint: PathPaint::default(),
+            uses_canonical_paint: false,
             has_triangle_fallback: false,
             contour_count: 0,
         }
     }
 
     /// Scale this path by the given factor.
-    pub fn scale(&self, factor: f32) -> Path<ScaledPixels> {
-        Path {
+    pub fn scale(&self, factor: f32) -> anyhow::Result<Path<ScaledPixels>> {
+        let tessellated = if self.uses_canonical_paint {
+            Some(self.tessellate_paint(self.paint)?)
+        } else {
+            None
+        };
+        let source = tessellated.as_ref().unwrap_or(self);
+        Ok(Path {
             id: self.id,
             order: self.order,
-            bounds: self.bounds.scale(factor),
+            bounds: source.bounds.scale(factor),
             content_mask: self.content_mask.scale(factor),
-            vertices: self
+            vertices: source
                 .vertices
                 .iter()
                 .map(|vertex| vertex.scale(factor))
@@ -929,12 +938,13 @@ impl Path<Pixels> {
                     PathPaint::Stroke(stroke)
                 }
             },
+            uses_canonical_paint: self.uses_canonical_paint,
             has_triangle_fallback: self.has_triangle_fallback,
             start: self.start.map(|start| start.scale(factor)),
             current: self.current.scale(factor),
             contour_count: self.contour_count,
             color: self.color,
-        }
+        })
     }
 
     /// Move the start, current point to the given point.
@@ -1021,14 +1031,69 @@ impl Path<Pixels> {
         self.commands.push(PathCommand::Close);
     }
 
-    /// Set the fill rule used by renderers with canonical path support.
-    pub fn set_fill_rule(&mut self, fill_rule: PathFillRule) {
-        self.paint = PathPaint::Fill(fill_rule);
+    /// Set the fill rule used to render this path.
+    pub fn set_fill_rule(&mut self, fill_rule: PathFillRule) -> anyhow::Result<()> {
+        self.set_paint(PathPaint::Fill(fill_rule))
     }
 
-    /// Set the stroke used by renderers with canonical path support.
-    pub fn set_stroke(&mut self, stroke: PathStroke) {
-        self.paint = PathPaint::Stroke(stroke);
+    /// Set the stroke used to render this path.
+    pub fn set_stroke(&mut self, stroke: PathStroke) -> anyhow::Result<()> {
+        self.set_paint(PathPaint::Stroke(stroke))
+    }
+
+    fn set_paint(&mut self, paint: PathPaint) -> anyhow::Result<()> {
+        let tessellated = self.tessellate_paint(paint)?;
+        self.vertices = tessellated.vertices;
+        self.bounds = tessellated.bounds;
+        self.paint = paint;
+        self.uses_canonical_paint = true;
+        Ok(())
+    }
+
+    fn tessellate_paint(&self, paint: PathPaint) -> anyhow::Result<Path<Pixels>> {
+        anyhow::ensure!(
+            !self.has_triangle_fallback,
+            "cannot apply canonical path paint to explicit triangle geometry"
+        );
+
+        let style = match paint {
+            PathPaint::Fill(fill_rule) => {
+                PathStyle::Fill(FillOptions::default().with_fill_rule(match fill_rule {
+                    PathFillRule::NonZero => FillRule::NonZero,
+                    PathFillRule::EvenOdd => FillRule::EvenOdd,
+                }))
+            }
+            PathPaint::Stroke(stroke) => PathStyle::Stroke(
+                StrokeOptions::default()
+                    .with_line_width(stroke.width)
+                    .with_miter_limit(stroke.miter_limit)
+                    .with_line_cap(match stroke.line_cap {
+                        PathLineCap::Butt => lyon::path::LineCap::Butt,
+                        PathLineCap::Round => lyon::path::LineCap::Round,
+                        PathLineCap::Square => lyon::path::LineCap::Square,
+                    })
+                    .with_line_join(match stroke.line_join {
+                        PathLineJoin::Miter => lyon::path::LineJoin::Miter,
+                        PathLineJoin::Round => lyon::path::LineJoin::Round,
+                        PathLineJoin::Bevel => lyon::path::LineJoin::Bevel,
+                    }),
+            ),
+        };
+        let mut builder = PathBuilder::default().with_style(style);
+        for command in &self.commands {
+            match command {
+                PathCommand::MoveTo(to) => builder.move_to(*to),
+                PathCommand::LineTo(to) => builder.line_to(*to),
+                PathCommand::QuadraticTo { control, to } => builder.curve_to(*to, *control),
+                PathCommand::CubicTo {
+                    control_1,
+                    control_2,
+                    to,
+                } => builder.cubic_bezier_to(*to, *control_1, *control_2),
+                PathCommand::Close => builder.close(),
+            }
+        }
+        builder.build()
     }
 
     fn line_to_for_tessellation(&mut self, to: Point<Pixels>) {
@@ -1166,7 +1231,7 @@ mod path_tests {
     use crate::{ScaledPixels, point, px};
 
     #[test]
-    fn path_retains_canonical_commands_and_explicit_triangle_fallback() {
+    fn path_retains_canonical_commands_and_explicit_triangle_fallback() -> anyhow::Result<()> {
         let mut path = Path::new(point(px(1.0), px(2.0)));
         path.line_to(point(px(3.0), px(4.0)));
         path.curve_to(point(px(7.0), px(8.0)), point(px(5.0), px(6.0)));
@@ -1176,7 +1241,7 @@ mod path_tests {
             point(px(11.0), px(12.0)),
         );
         path.close();
-        path.set_fill_rule(PathFillRule::EvenOdd);
+        path.set_fill_rule(PathFillRule::EvenOdd)?;
 
         assert!(matches!(
             path.commands(),
@@ -1197,8 +1262,8 @@ mod path_tests {
             line_cap: PathLineCap::Round,
             line_join: PathLineJoin::Bevel,
         };
-        path.set_stroke(stroke);
-        let scaled = path.scale(2.0);
+        path.set_stroke(stroke)?;
+        let scaled = path.scale(2.0)?;
         assert_eq!(
             scaled.paint(),
             PathPaint::Stroke(PathStroke {
@@ -1221,6 +1286,7 @@ mod path_tests {
             (point(0.0, 0.0), point(0.0, 1.0), point(1.0, 1.0)),
         );
         assert!(path.uses_triangle_fallback());
+        Ok(())
     }
 }
 
