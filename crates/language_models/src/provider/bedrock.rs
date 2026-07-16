@@ -1986,8 +1986,13 @@ pub fn into_bedrock(
 
         match message.role {
             Role::User | Role::Assistant => {
-                let mut bedrock_message_content: Vec<BedrockInnerContent> = message
-                    .content
+                let mut message_content = message.content;
+                if message.role == Role::User {
+                    // Bedrock requires tool results to precede other blocks in a user turn.
+                    message_content
+                        .sort_by_key(|content| !matches!(content, MessageContent::ToolResult(_)));
+                }
+                let mut bedrock_message_content: Vec<BedrockInnerContent> = message_content
                     .into_iter()
                     .filter_map(|content| match content {
                         MessageContent::Text(text) => {
@@ -2873,7 +2878,9 @@ impl ConfigurationView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use language_model::LanguageModelRequestMessage;
+    use language_model::{
+        LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUseId,
+    };
     use open_ai::responses::{
         ResponseFunctionToolCall, ResponseOutputMessage, ResponseReasoningItem,
     };
@@ -2894,6 +2901,42 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_user_tool_results_precede_other_content() {
+        let tool_result = |id: &'static str| {
+            MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: LanguageModelToolUseId::from(id),
+                tool_name: Arc::from("read_file"),
+                is_error: false,
+                content: vec![LanguageModelToolResultContent::Text(Arc::from(id))],
+                output: None,
+            })
+        };
+        let request = into_bedrock_request(vec![LanguageModelRequestMessage {
+            role: Role::User,
+            content: vec![
+                MessageContent::Text("before".into()),
+                tool_result("call-1"),
+                MessageContent::Text("between".into()),
+                tool_result("call-2"),
+                MessageContent::Text("after".into()),
+            ],
+            cache: false,
+            reasoning_details: None,
+        }]);
+
+        assert!(matches!(
+            request.messages[0].content(),
+            [
+                BedrockInnerContent::ToolResult(_),
+                BedrockInnerContent::ToolResult(_),
+                BedrockInnerContent::Text(_),
+                BedrockInnerContent::Text(_),
+                BedrockInnerContent::Text(_),
+            ]
+        ));
     }
 
     #[test]
