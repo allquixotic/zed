@@ -359,17 +359,37 @@ pub enum BedrockTargetKind {
     FoundationModel,
     SystemInferenceProfile,
     ApplicationInferenceProfile,
+    MantleModel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BedrockTargetProtocol {
+    Converse,
+    OpenAiChatCompletions,
+    OpenAiResponses,
+    AnthropicMessages,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BedrockTargetCapabilities {
+    pub max_token_count: u64,
+    pub max_output_tokens: u64,
+    pub supports_tools: bool,
+    pub supports_images: bool,
+    pub supports_thinking: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BedrockTargetDescriptor {
     pub endpoint: BedrockEndpoint,
     pub kind: BedrockTargetKind,
+    pub protocol: BedrockTargetProtocol,
     pub id: String,
     pub invocation_id: String,
     pub arn: Option<String>,
     pub base_model_id: String,
     pub display_name: String,
+    pub capabilities: BedrockTargetCapabilities,
 }
 
 impl BedrockTargetDescriptor {
@@ -377,9 +397,9 @@ impl BedrockTargetDescriptor {
         let base_model = ConverseModel::from_request_id(&self.base_model_id).unwrap_or_else(|| {
             ConverseModel::Custom {
                 name: self.base_model_id,
-                max_tokens: 128_000,
+                max_tokens: self.capabilities.max_token_count,
                 display_name: None,
-                max_output_tokens: Some(4_096),
+                max_output_tokens: Some(self.capabilities.max_output_tokens),
                 default_temperature: None,
                 cache_configuration: None,
             }
@@ -390,6 +410,58 @@ impl BedrockTargetDescriptor {
             display_name: self.display_name,
             base_model: Box::new(base_model),
         }
+    }
+
+    fn into_mantle_model(self) -> MantleModel {
+        MantleModel::Discovered {
+            id: self.id,
+            request_id: self.invocation_id,
+            display_name: self.display_name,
+            protocol: match self.protocol {
+                BedrockTargetProtocol::OpenAiChatCompletions => MantleProtocol::ChatCompletions,
+                BedrockTargetProtocol::OpenAiResponses => MantleProtocol::Responses,
+                BedrockTargetProtocol::AnthropicMessages => MantleProtocol::AnthropicMessages,
+                BedrockTargetProtocol::Converse => MantleProtocol::ChatCompletions,
+            },
+            max_tokens: self.capabilities.max_token_count,
+            max_output_tokens: self.capabilities.max_output_tokens,
+            supports_tools: self.capabilities.supports_tools,
+            supports_images: self.capabilities.supports_images,
+            supports_thinking: self.capabilities.supports_thinking,
+        }
+    }
+}
+
+fn conservative_target_capabilities() -> BedrockTargetCapabilities {
+    BedrockTargetCapabilities {
+        max_token_count: 128_000,
+        max_output_tokens: 4_096,
+        supports_tools: false,
+        supports_images: false,
+        supports_thinking: false,
+    }
+}
+
+fn converse_target_capabilities(model_id: &str) -> BedrockTargetCapabilities {
+    ConverseModel::from_request_id(model_id).map_or_else(
+        conservative_target_capabilities,
+        |model| BedrockTargetCapabilities {
+            max_token_count: model.max_token_count(),
+            max_output_tokens: model.max_output_tokens(),
+            supports_tools: model.supports_tool_use(),
+            supports_images: model.supports_images(),
+            supports_thinking: model.supports_thinking(),
+        },
+    )
+}
+
+fn mantle_target_capabilities(model: &MantleModel) -> BedrockTargetCapabilities {
+    BedrockTargetCapabilities {
+        max_token_count: model.max_token_count(),
+        max_output_tokens: model.max_output_tokens(),
+        supports_tools: model.supports_tools(),
+        supports_images: model.supports_images(),
+        supports_thinking: model.supports_thinking(),
     }
 }
 
@@ -552,16 +624,19 @@ async fn discover_runtime_targets(
             continue;
         }
         let id = format!("bedrock-runtime:foundation:{}", model.model_id);
+        let capabilities = converse_target_capabilities(&model.model_id);
         targets.insert(
             id.clone(),
             BedrockTargetDescriptor {
                 endpoint: BedrockEndpoint::Runtime,
                 kind: BedrockTargetKind::FoundationModel,
+                protocol: BedrockTargetProtocol::Converse,
                 id,
                 invocation_id: model.model_id.clone(),
                 arn: Some(model.model_arn),
                 base_model_id: model.model_id.clone(),
                 display_name: model.model_name.unwrap_or(model.model_id),
+                capabilities,
             },
         );
     }
@@ -582,16 +657,19 @@ async fn discover_runtime_targets(
             _ => continue,
         };
         let id = format!("bedrock-runtime:profile:{}", profile.id);
+        let capabilities = converse_target_capabilities(&base_model_id);
         targets.insert(
             id.clone(),
             BedrockTargetDescriptor {
                 endpoint: BedrockEndpoint::Runtime,
                 kind,
+                protocol: BedrockTargetProtocol::Converse,
                 id,
                 invocation_id: profile.id,
                 arn: Some(profile.arn),
                 base_model_id,
                 display_name: profile.name,
+                capabilities,
             },
         );
     }
@@ -610,6 +688,107 @@ async fn discover_runtime_targets(
             ))
     });
     Ok(targets)
+}
+
+#[derive(Deserialize)]
+struct MantleModelsResponse {
+    data: Vec<MantleModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct MantleModelEntry {
+    id: String,
+}
+
+fn mantle_target_protocol(model: &MantleModel) -> BedrockTargetProtocol {
+    match model.protocol() {
+        MantleProtocol::ChatCompletions => BedrockTargetProtocol::OpenAiChatCompletions,
+        MantleProtocol::Responses => BedrockTargetProtocol::OpenAiResponses,
+        MantleProtocol::AnthropicMessages => BedrockTargetProtocol::AnthropicMessages,
+    }
+}
+
+fn conservative_mantle_protocol(model_id: &str) -> BedrockTargetProtocol {
+    if model_id.starts_with("anthropic.") {
+        BedrockTargetProtocol::AnthropicMessages
+    } else if model_id.starts_with("openai.") || model_id.starts_with("xai.") {
+        BedrockTargetProtocol::OpenAiResponses
+    } else {
+        BedrockTargetProtocol::OpenAiChatCompletions
+    }
+}
+
+fn mantle_targets_from_model_ids(
+    model_ids: impl IntoIterator<Item = String>,
+) -> Vec<BedrockTargetDescriptor> {
+    let mut targets = BTreeMap::default();
+    for model_id in model_ids {
+        let known_model = MantleModel::from_request_id(&model_id);
+        let (id, display_name, protocol, capabilities) = if let Some(model) = known_model {
+            (
+                model.id().to_string(),
+                model.display_name().to_string(),
+                mantle_target_protocol(&model),
+                mantle_target_capabilities(&model),
+            )
+        } else {
+            (
+                format!("bedrock-mantle/{model_id}"),
+                model_id.clone(),
+                conservative_mantle_protocol(&model_id),
+                conservative_target_capabilities(),
+            )
+        };
+        targets.insert(
+            id.clone(),
+            BedrockTargetDescriptor {
+                endpoint: BedrockEndpoint::Mantle,
+                kind: BedrockTargetKind::MantleModel,
+                protocol,
+                id,
+                invocation_id: model_id.clone(),
+                arn: None,
+                base_model_id: model_id,
+                display_name,
+                capabilities,
+            },
+        );
+    }
+    targets.into_values().collect()
+}
+
+fn parse_mantle_model_catalog(body: &str) -> Result<Vec<BedrockTargetDescriptor>> {
+    let response: MantleModelsResponse =
+        serde_json::from_str(body).context("parsing Bedrock Mantle model catalog")?;
+    Ok(mantle_targets_from_model_ids(
+        response.data.into_iter().map(|model| model.id),
+    ))
+}
+
+async fn discover_mantle_targets(
+    client: &dyn HttpClient,
+    region: &str,
+    auth: &MantleAuth,
+    extra_headers: &CustomHeaders,
+) -> Result<Vec<BedrockTargetDescriptor>> {
+    let url = mantle_endpoint_url(region, "v1/models");
+    let request =
+        build_mantle_http_request(Method::GET, &url, &[], region, auth, extra_headers, &[])?;
+    let mut response = client
+        .send(request)
+        .await
+        .context("listing Bedrock Mantle models")?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("Bedrock Mantle model discovery returned {status}");
+    }
+    let mut body = String::new();
+    response
+        .body_mut()
+        .read_to_string(&mut body)
+        .await
+        .context("reading Bedrock Mantle model catalog")?;
+    parse_mantle_model_catalog(&body)
 }
 
 fn mantle_protocol_from_settings(value: settings::BedrockMantleProtocolContent) -> MantleProtocol {
@@ -791,10 +970,14 @@ pub struct State {
     credentials_from_env: bool,
     credentials_provider: Arc<dyn CredentialsProvider>,
     aws_http_client: AwsHttpClient,
+    plain_http_client: Arc<dyn HttpClient>,
     aws_session_cache: AwsSessionCache,
     runtime_targets: Vec<BedrockTargetDescriptor>,
     runtime_discovery_error: Option<String>,
-    runtime_discovery_task: Task<()>,
+    mantle_targets: Vec<BedrockTargetDescriptor>,
+    mantle_discovery_error: Option<String>,
+    mantle_endpoint_available: Option<bool>,
+    discovery_task: Task<()>,
     _subscription: Subscription,
 }
 
@@ -803,36 +986,72 @@ impl State {
         if self.auth != auth {
             self.auth = auth;
             self.aws_session_cache.invalidate();
-            self.runtime_targets.clear();
-            self.runtime_discovery_error = None;
-            self.runtime_discovery_task = Task::ready(());
+            self.reset_discovery();
         }
     }
 
-    fn refresh_runtime_targets(&mut self, cx: &mut Context<Self>) {
+    fn reset_discovery(&mut self) {
+        self.runtime_targets.clear();
+        self.runtime_discovery_error = None;
+        self.mantle_targets.clear();
+        self.mantle_discovery_error = None;
+        self.mantle_endpoint_available = None;
+        self.discovery_task = Task::ready(());
+    }
+
+    fn refresh_targets(&mut self, cx: &mut Context<Self>) {
         if !self.is_authenticated() {
             return;
         }
 
         let session_cache = self.aws_session_cache.clone();
         let configuration = self.aws_session_configuration();
-        let http_client = self.aws_http_client.clone();
+        let aws_http_client = self.aws_http_client.clone();
+        let plain_http_client = self.plain_http_client.clone();
+        let region = configuration.region.clone();
+        let mantle_endpoint_available = MANTLE_SUPPORTED_REGIONS.contains(&region.as_str());
+        let extra_headers = self
+            .settings
+            .as_ref()
+            .map(|settings| settings.custom_headers.clone())
+            .unwrap_or_default();
         self.runtime_discovery_error = None;
-        self.runtime_discovery_task = cx.spawn(async move |this, cx| {
-            let result = async {
-                let session = session_cache
-                    .cell
-                    .get_or_try_init(|| build_aws_session(configuration, http_client))
-                    .await?;
-                discover_runtime_targets(&AwsRuntimeCatalogSource {
-                    client: session.control_client.clone(),
-                })
-                .await
-            }
-            .await;
+        self.mantle_discovery_error = None;
+        self.mantle_endpoint_available = Some(mantle_endpoint_available);
+        self.discovery_task = cx.spawn(async move |this, cx| {
+            let session = session_cache
+                .cell
+                .get_or_try_init(|| build_aws_session(configuration, aws_http_client))
+                .await;
+            let (runtime_result, mantle_result) = match session {
+                Ok(session) => {
+                    let runtime_source = AwsRuntimeCatalogSource {
+                        client: session.control_client.clone(),
+                    };
+                    let runtime = discover_runtime_targets(&runtime_source);
+                    let mantle = async {
+                        if !mantle_endpoint_available {
+                            return Ok(Vec::new());
+                        }
+                        let auth = session.resolve_mantle_auth().await?;
+                        discover_mantle_targets(
+                            plain_http_client.as_ref(),
+                            &region,
+                            &auth,
+                            &extra_headers,
+                        )
+                        .await
+                    };
+                    futures::join!(runtime, mantle)
+                }
+                Err(error) => {
+                    let error = format!("initializing Bedrock session: {error}");
+                    (Err(anyhow!(error.clone())), Err(anyhow!(error)))
+                }
+            };
 
             if let Err(error) = this.update(cx, |this, cx| {
-                match result {
+                match runtime_result {
                     Ok(targets) => {
                         this.runtime_targets = targets;
                         this.runtime_discovery_error = None;
@@ -842,11 +1061,22 @@ impl State {
                         this.runtime_discovery_error = Some(format!("{error:#}"));
                     }
                 }
+                match mantle_result {
+                    Ok(targets) => {
+                        this.mantle_targets = targets;
+                        this.mantle_discovery_error = None;
+                    }
+                    Err(error) => {
+                        log::warn!("Bedrock Mantle model discovery failed: {error:#}");
+                        this.mantle_discovery_error = Some(format!("{error:#}"));
+                    }
+                }
                 cx.notify();
             }) {
                 log::debug!("Bedrock provider was dropped during model discovery: {error:#}");
             }
         });
+        cx.notify();
     }
 
     fn aws_session_configuration(&self) -> AwsSessionConfiguration {
@@ -1073,19 +1303,21 @@ impl BedrockLanguageModelProvider {
             credentials_from_env: false,
             credentials_provider,
             aws_http_client: aws_http_client.clone(),
+            plain_http_client: http_client.clone(),
             aws_session_cache: AwsSessionCache::default(),
             runtime_targets: Vec::new(),
             runtime_discovery_error: None,
-            runtime_discovery_task: Task::ready(()),
+            mantle_targets: Vec::new(),
+            mantle_discovery_error: None,
+            mantle_endpoint_available: None,
+            discovery_task: Task::ready(()),
             _subscription: cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
                 let settings = AllLanguageModelSettings::get_global(cx).bedrock.clone();
                 if this.settings.as_ref() != Some(&settings) {
                     this.settings = Some(settings);
                     this.aws_session_cache.invalidate();
-                    this.runtime_targets.clear();
-                    this.runtime_discovery_error = None;
-                    this.runtime_discovery_task = Task::ready(());
-                    this.refresh_runtime_targets(cx);
+                    this.reset_discovery();
+                    this.refresh_targets(cx);
                 }
                 cx.notify();
             }),
@@ -1120,6 +1352,21 @@ impl BedrockLanguageModelProvider {
             request_limiter: RateLimiter::new(4),
         })
     }
+
+    fn discovered_runtime_model(
+        &self,
+        base_model_id: &str,
+        cx: &App,
+    ) -> Option<Arc<dyn LanguageModel>> {
+        let state = self.state.read(cx);
+        let target = state
+            .runtime_targets
+            .iter()
+            .find(|target| target.base_model_id == base_model_id)
+            .or_else(|| state.runtime_targets.first())
+            .cloned()?;
+        Some(self.create_language_model(target.into_converse_model()))
+    }
 }
 
 impl LanguageModelProvider for BedrockLanguageModelProvider {
@@ -1135,20 +1382,25 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
         IconOrSvg::Icon(IconName::AiBedrock)
     }
 
-    fn default_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        Some(self.create_language_model(bedrock::ConverseModel::default()))
+    fn default_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
+        let model = bedrock::ConverseModel::default();
+        self.discovered_runtime_model(model.request_id(), cx)
+            .or_else(|| Some(self.create_language_model(model)))
     }
 
     fn default_fast_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
         let region = self.state.read(cx).get_region();
-        Some(self.create_language_model(bedrock::ConverseModel::default_fast(region.as_str())))
+        let model = bedrock::ConverseModel::default_fast(region.as_str());
+        self.discovered_runtime_model(model.request_id(), cx)
+            .or_else(|| Some(self.create_language_model(model)))
     }
 
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
         let bedrock_settings = &AllLanguageModelSettings::get_global(cx).bedrock;
         let mut models = BTreeMap::default();
 
-        let runtime_targets = &self.state.read(cx).runtime_targets;
+        let state = self.state.read(cx);
+        let runtime_targets = &state.runtime_targets;
         if runtime_targets.is_empty() {
             for model in bedrock::ConverseModel::iter() {
                 if !matches!(
@@ -1193,8 +1445,20 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
 
         let mut mantle_models = BTreeMap::default();
 
-        for model in bedrock::MantleModel::iter() {
-            if !matches!(model, bedrock::MantleModel::Custom { .. }) {
+        if state.mantle_targets.is_empty() {
+            for model in bedrock::MantleModel::iter().filter(|model| {
+                !matches!(
+                    model,
+                    bedrock::MantleModel::Custom { .. } | bedrock::MantleModel::Discovered { .. }
+                )
+            }) {
+                if state.mantle_endpoint_available != Some(false) {
+                    mantle_models.insert(model.id().to_string(), model);
+                }
+            }
+        } else {
+            for target in state.mantle_targets.iter().cloned() {
+                let model = target.into_mantle_model();
                 mantle_models.insert(model.id().to_string(), model);
             }
         }
@@ -1234,7 +1498,7 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
         let state = self.state.clone();
         cx.spawn(async move |cx| {
             authenticate.await?;
-            state.update(cx, |state, cx| state.refresh_runtime_targets(cx));
+            state.update(cx, |state, cx| state.refresh_targets(cx));
             Ok(())
         })
     }
@@ -1650,6 +1914,7 @@ fn parse_mantle_anthropic_stream_line(line: &str) -> Result<anthropic::Event> {
 }
 
 fn build_mantle_http_request(
+    method: Method,
     url: &str,
     body: &[u8],
     region: &str,
@@ -1658,7 +1923,7 @@ fn build_mantle_http_request(
     required_headers: &'static [(&'static str, &'static str)],
 ) -> Result<HttpRequest<AsyncBody>> {
     let mut request = HttpRequest::builder()
-        .method(Method::POST)
+        .method(method)
         .uri(url)
         .header("Content-Type", "application/json")
         .extra_headers(extra_headers)
@@ -1689,9 +1954,16 @@ where
     Event: Send + 'static,
 {
     let body = serde_json::to_vec(&request).map_err(|error| RequestError::Other(error.into()))?;
-    let request =
-        build_mantle_http_request(url, &body, region, auth, extra_headers, required_headers)
-            .map_err(RequestError::Other)?;
+    let request = build_mantle_http_request(
+        Method::POST,
+        url,
+        &body,
+        region,
+        auth,
+        extra_headers,
+        required_headers,
+    )
+    .map_err(RequestError::Other)?;
 
     let mut response = client.send(request).await?;
     if response.status().is_success() {
@@ -3598,6 +3870,7 @@ mod tests {
         let model = BedrockTargetDescriptor {
             endpoint: BedrockEndpoint::Runtime,
             kind: BedrockTargetKind::ApplicationInferenceProfile,
+            protocol: BedrockTargetProtocol::Converse,
             id: "bedrock-runtime:profile:cost-center".to_string(),
             invocation_id: "cost-center".to_string(),
             arn: Some(
@@ -3605,6 +3878,7 @@ mod tests {
             ),
             base_model_id: "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
             display_name: "Cost center".to_string(),
+            capabilities: converse_target_capabilities("anthropic.claude-sonnet-4-5-20250929-v1:0"),
         }
         .into_converse_model();
 
@@ -3618,6 +3892,107 @@ mod tests {
         assert!(model.supports_images());
         assert!(model.supports_thinking());
         assert_eq!(model.max_token_count(), 1_000_000);
+    }
+
+    #[test]
+    fn test_mantle_catalog_merges_known_models_and_future_fallbacks() {
+        let targets = parse_mantle_model_catalog(
+            r#"{
+                "object": "list",
+                "data": [
+                    {"id": "anthropic.claude-fable-5", "owned_by": "aws"},
+                    {"id": "openai.gpt-5.6-sol"},
+                    {"id": "anthropic.claude-future"},
+                    {"id": "openai.gpt-future"},
+                    {"id": "future-provider.text-model"},
+                    {"id": "anthropic.claude-fable-5"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(targets.len(), 5);
+        let fable = targets
+            .iter()
+            .find(|target| target.invocation_id == "anthropic.claude-fable-5")
+            .unwrap();
+        assert_eq!(fable.id, "bedrock-mantle/claude-fable-5");
+        assert_eq!(fable.protocol, BedrockTargetProtocol::AnthropicMessages);
+        assert!(fable.capabilities.supports_tools);
+        assert!(fable.capabilities.supports_images);
+        assert!(fable.capabilities.supports_thinking);
+        assert_eq!(fable.capabilities.max_token_count, 1_000_000);
+
+        let future_anthropic = targets
+            .iter()
+            .find(|target| target.invocation_id == "anthropic.claude-future")
+            .unwrap();
+        assert_eq!(
+            future_anthropic.protocol,
+            BedrockTargetProtocol::AnthropicMessages
+        );
+        assert!(!future_anthropic.capabilities.supports_tools);
+        assert!(!future_anthropic.capabilities.supports_images);
+        assert!(!future_anthropic.capabilities.supports_thinking);
+
+        let future_openai = targets
+            .iter()
+            .find(|target| target.invocation_id == "openai.gpt-future")
+            .unwrap();
+        assert_eq!(
+            future_openai.protocol,
+            BedrockTargetProtocol::OpenAiResponses
+        );
+        let future_other = targets
+            .iter()
+            .find(|target| target.invocation_id == "future-provider.text-model")
+            .unwrap();
+        assert_eq!(
+            future_other.protocol,
+            BedrockTargetProtocol::OpenAiChatCompletions
+        );
+    }
+
+    #[test]
+    fn test_discovered_mantle_model_preserves_ui_and_request_ids() {
+        let model = mantle_targets_from_model_ids(["anthropic.claude-fable-5".to_string()])
+            .into_iter()
+            .next()
+            .unwrap()
+            .into_mantle_model();
+
+        assert_eq!(model.id(), "bedrock-mantle/claude-fable-5");
+        assert_eq!(model.request_id(), "anthropic.claude-fable-5");
+        assert_eq!(model.protocol(), MantleProtocol::AnthropicMessages);
+        assert!(model.supports_tools());
+        assert_eq!(model.max_output_tokens(), 128_000);
+    }
+
+    #[test]
+    fn test_mantle_catalog_request_supports_bearer_auth() {
+        let url = mantle_endpoint_url("us-east-1", "v1/models");
+        let request = build_mantle_http_request(
+            Method::GET,
+            &url,
+            &[],
+            "us-east-1",
+            &MantleAuth::ApiKey {
+                api_key: "test-api-key".to_string(),
+            },
+            &CustomHeaders::default(),
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.uri().to_string(), url);
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer test-api-key")
+        );
     }
 
     #[test]
@@ -3792,6 +4167,7 @@ mod tests {
         let body = br#"{"model":"anthropic.claude-mythos-5","stream":true}"#;
         let url = mantle_endpoint_url("us-east-1", "anthropic/v1/messages");
         let request = build_mantle_http_request(
+            Method::POST,
             &url,
             body,
             "us-east-1",
