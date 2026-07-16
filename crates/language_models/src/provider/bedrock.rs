@@ -264,6 +264,7 @@ struct AwsSessionConfiguration {
 
 struct AwsSession {
     sdk_config: aws_types::SdkConfig,
+    control_client: aws_sdk_bedrock::Client,
     runtime_client: BedrockClient,
     api_key: Option<String>,
 }
@@ -335,12 +336,278 @@ async fn build_aws_session(
     }
 
     let sdk_config = config_builder.load().await;
+    let control_client = aws_sdk_bedrock::Client::new(&sdk_config);
     let runtime_client = BedrockClient::new(&sdk_config);
     Ok(AwsSession {
         sdk_config,
+        control_client,
         runtime_client,
         api_key,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BedrockEndpoint {
+    Runtime,
+    Mantle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BedrockTargetKind {
+    FoundationModel,
+    SystemInferenceProfile,
+    ApplicationInferenceProfile,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BedrockTargetDescriptor {
+    pub endpoint: BedrockEndpoint,
+    pub kind: BedrockTargetKind,
+    pub id: String,
+    pub invocation_id: String,
+    pub arn: Option<String>,
+    pub base_model_id: String,
+    pub display_name: String,
+}
+
+impl BedrockTargetDescriptor {
+    fn into_converse_model(self) -> ConverseModel {
+        let base_model = ConverseModel::from_request_id(&self.base_model_id).unwrap_or_else(|| {
+            ConverseModel::Custom {
+                name: self.base_model_id,
+                max_tokens: 128_000,
+                display_name: None,
+                max_output_tokens: Some(4_096),
+                default_temperature: None,
+                cache_configuration: None,
+            }
+        });
+        ConverseModel::Discovered {
+            id: self.id,
+            invocation_id: self.invocation_id,
+            display_name: self.display_name,
+            base_model: Box::new(base_model),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeFoundationModel {
+    model_arn: String,
+    model_id: String,
+    model_name: Option<String>,
+    output_modalities: Vec<String>,
+    response_streaming_supported: Option<bool>,
+    inference_types_supported: Vec<String>,
+    lifecycle_status: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeInferenceProfile {
+    name: String,
+    arn: String,
+    model_arns: Vec<String>,
+    id: String,
+    status: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeInferenceProfilePage {
+    profiles: Vec<RuntimeInferenceProfile>,
+    next_token: Option<String>,
+}
+
+trait RuntimeCatalogSource: Send + Sync {
+    fn list_foundation_models(&self) -> BoxFuture<'_, Result<Vec<RuntimeFoundationModel>>>;
+    fn list_inference_profiles(
+        &self,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<RuntimeInferenceProfilePage>>;
+}
+
+struct AwsRuntimeCatalogSource {
+    client: aws_sdk_bedrock::Client,
+}
+
+impl RuntimeCatalogSource for AwsRuntimeCatalogSource {
+    fn list_foundation_models(&self) -> BoxFuture<'_, Result<Vec<RuntimeFoundationModel>>> {
+        async move {
+            let output = self
+                .client
+                .list_foundation_models()
+                .send()
+                .await
+                .context("listing Bedrock foundation models")?;
+            Ok(output
+                .model_summaries()
+                .iter()
+                .map(|model| RuntimeFoundationModel {
+                    model_arn: model.model_arn().to_string(),
+                    model_id: model.model_id().to_string(),
+                    model_name: model.model_name().map(str::to_string),
+                    output_modalities: model
+                        .output_modalities()
+                        .iter()
+                        .map(|modality| modality.as_str().to_string())
+                        .collect(),
+                    response_streaming_supported: model.response_streaming_supported(),
+                    inference_types_supported: model
+                        .inference_types_supported()
+                        .iter()
+                        .map(|inference_type| inference_type.as_str().to_string())
+                        .collect(),
+                    lifecycle_status: model
+                        .model_lifecycle()
+                        .map(|lifecycle| lifecycle.status().as_str().to_string()),
+                })
+                .collect())
+        }
+        .boxed()
+    }
+
+    fn list_inference_profiles(
+        &self,
+        next_token: Option<String>,
+    ) -> BoxFuture<'_, Result<RuntimeInferenceProfilePage>> {
+        async move {
+            let mut request = self.client.list_inference_profiles().max_results(100);
+            if let Some(next_token) = next_token {
+                request = request.next_token(next_token);
+            }
+            let output = request
+                .send()
+                .await
+                .context("listing Bedrock inference profiles")?;
+            Ok(RuntimeInferenceProfilePage {
+                profiles: output
+                    .inference_profile_summaries()
+                    .iter()
+                    .map(|profile| RuntimeInferenceProfile {
+                        name: profile.inference_profile_name().to_string(),
+                        arn: profile.inference_profile_arn().to_string(),
+                        model_arns: profile
+                            .models()
+                            .iter()
+                            .filter_map(|model| model.model_arn().map(str::to_string))
+                            .collect(),
+                        id: profile.inference_profile_id().to_string(),
+                        status: profile.status().as_str().to_string(),
+                        kind: profile.r#type().as_str().to_string(),
+                    })
+                    .collect(),
+                next_token: output.next_token().map(str::to_string),
+            })
+        }
+        .boxed()
+    }
+}
+
+async fn discover_runtime_targets(
+    source: &dyn RuntimeCatalogSource,
+) -> Result<Vec<BedrockTargetDescriptor>> {
+    let foundation_models = source.list_foundation_models();
+    let inference_profiles = async {
+        let mut profiles = Vec::new();
+        let mut next_token: Option<String> = None;
+        let mut seen_tokens = BTreeMap::default();
+        loop {
+            if let Some(token) = next_token.as_ref() {
+                if seen_tokens.insert(token.clone(), ()).is_some() {
+                    return Err(anyhow!(
+                        "Bedrock returned a repeated inference-profile page token"
+                    ));
+                }
+            }
+            let page = source.list_inference_profiles(next_token).await?;
+            profiles.extend(page.profiles);
+            next_token = page.next_token;
+            if next_token.is_none() {
+                break;
+            }
+        }
+        Ok::<_, anyhow::Error>(profiles)
+    };
+    let (foundation_models, inference_profiles) =
+        futures::try_join!(foundation_models, inference_profiles)?;
+
+    let mut targets = BTreeMap::default();
+    for model in foundation_models {
+        if model
+            .lifecycle_status
+            .as_deref()
+            .is_some_and(|status| status != "ACTIVE")
+            || !model
+                .output_modalities
+                .iter()
+                .any(|modality| modality == "TEXT")
+            || model.response_streaming_supported == Some(false)
+            || !model
+                .inference_types_supported
+                .iter()
+                .any(|inference_type| inference_type == "ON_DEMAND")
+        {
+            continue;
+        }
+        let id = format!("bedrock-runtime:foundation:{}", model.model_id);
+        targets.insert(
+            id.clone(),
+            BedrockTargetDescriptor {
+                endpoint: BedrockEndpoint::Runtime,
+                kind: BedrockTargetKind::FoundationModel,
+                id,
+                invocation_id: model.model_id.clone(),
+                arn: Some(model.model_arn),
+                base_model_id: model.model_id.clone(),
+                display_name: model.model_name.unwrap_or(model.model_id),
+            },
+        );
+    }
+
+    for profile in inference_profiles {
+        if profile.status != "ACTIVE" {
+            continue;
+        }
+        let Some(base_model_id) = profile.model_arns.iter().find_map(|arn| {
+            arn.split_once("foundation-model/")
+                .map(|(_, model_id)| model_id.to_string())
+        }) else {
+            continue;
+        };
+        let kind = match profile.kind.as_str() {
+            "SYSTEM_DEFINED" => BedrockTargetKind::SystemInferenceProfile,
+            "APPLICATION" => BedrockTargetKind::ApplicationInferenceProfile,
+            _ => continue,
+        };
+        let id = format!("bedrock-runtime:profile:{}", profile.id);
+        targets.insert(
+            id.clone(),
+            BedrockTargetDescriptor {
+                endpoint: BedrockEndpoint::Runtime,
+                kind,
+                id,
+                invocation_id: profile.id,
+                arn: Some(profile.arn),
+                base_model_id,
+                display_name: profile.name,
+            },
+        );
+    }
+
+    let mut targets = targets.into_values().collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        (
+            left.kind,
+            left.base_model_id.as_str(),
+            left.display_name.as_str(),
+        )
+            .cmp(&(
+                right.kind,
+                right.base_model_id.as_str(),
+                right.display_name.as_str(),
+            ))
+    });
+    Ok(targets)
 }
 
 fn mantle_protocol_from_settings(value: settings::BedrockMantleProtocolContent) -> MantleProtocol {
@@ -516,7 +783,11 @@ pub struct State {
     /// Whether credentials came from environment variables (only relevant for static credentials)
     credentials_from_env: bool,
     credentials_provider: Arc<dyn CredentialsProvider>,
+    aws_http_client: AwsHttpClient,
     aws_session_cache: AwsSessionCache,
+    runtime_targets: Vec<BedrockTargetDescriptor>,
+    runtime_discovery_error: Option<String>,
+    runtime_discovery_task: Task<()>,
     _subscription: Subscription,
 }
 
@@ -525,7 +796,50 @@ impl State {
         if self.auth != auth {
             self.auth = auth;
             self.aws_session_cache.invalidate();
+            self.runtime_targets.clear();
+            self.runtime_discovery_error = None;
+            self.runtime_discovery_task = Task::ready(());
         }
+    }
+
+    fn refresh_runtime_targets(&mut self, cx: &mut Context<Self>) {
+        if !self.is_authenticated() {
+            return;
+        }
+
+        let session_cache = self.aws_session_cache.clone();
+        let configuration = self.aws_session_configuration();
+        let http_client = self.aws_http_client.clone();
+        self.runtime_discovery_error = None;
+        self.runtime_discovery_task = cx.spawn(async move |this, cx| {
+            let result = async {
+                let session = session_cache
+                    .cell
+                    .get_or_try_init(|| build_aws_session(configuration, http_client))
+                    .await?;
+                discover_runtime_targets(&AwsRuntimeCatalogSource {
+                    client: session.control_client.clone(),
+                })
+                .await
+            }
+            .await;
+
+            if let Err(error) = this.update(cx, |this, cx| {
+                match result {
+                    Ok(targets) => {
+                        this.runtime_targets = targets;
+                        this.runtime_discovery_error = None;
+                    }
+                    Err(error) => {
+                        log::warn!("Bedrock model discovery failed: {error:#}");
+                        this.runtime_discovery_error = Some(format!("{error:#}"));
+                    }
+                }
+                cx.notify();
+            }) {
+                log::debug!("Bedrock provider was dropped during model discovery: {error:#}");
+            }
+        });
     }
 
     fn aws_session_configuration(&self) -> AwsSessionConfiguration {
@@ -745,24 +1059,33 @@ impl BedrockLanguageModelProvider {
         credentials_provider: Arc<dyn CredentialsProvider>,
         cx: &mut App,
     ) -> Self {
+        let aws_http_client = AwsHttpClient::new(http_client.clone());
         let state = cx.new(|cx| State {
             auth: None,
             settings: Some(AllLanguageModelSettings::get_global(cx).bedrock.clone()),
             credentials_from_env: false,
             credentials_provider,
+            aws_http_client: aws_http_client.clone(),
             aws_session_cache: AwsSessionCache::default(),
+            runtime_targets: Vec::new(),
+            runtime_discovery_error: None,
+            runtime_discovery_task: Task::ready(()),
             _subscription: cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
                 let settings = AllLanguageModelSettings::get_global(cx).bedrock.clone();
                 if this.settings.as_ref() != Some(&settings) {
                     this.settings = Some(settings);
                     this.aws_session_cache.invalidate();
+                    this.runtime_targets.clear();
+                    this.runtime_discovery_error = None;
+                    this.runtime_discovery_task = Task::ready(());
+                    this.refresh_runtime_targets(cx);
                 }
                 cx.notify();
             }),
         });
 
         Self {
-            http_client: AwsHttpClient::new(http_client.clone()),
+            http_client: aws_http_client,
             plain_http_client: http_client,
             handle: Tokio::handle(cx),
             state,
@@ -818,8 +1141,20 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
         let bedrock_settings = &AllLanguageModelSettings::get_global(cx).bedrock;
         let mut models = BTreeMap::default();
 
-        for model in bedrock::ConverseModel::iter() {
-            if !matches!(model, bedrock::ConverseModel::Custom { .. }) {
+        let runtime_targets = &self.state.read(cx).runtime_targets;
+        if runtime_targets.is_empty() {
+            for model in bedrock::ConverseModel::iter() {
+                if !matches!(
+                    model,
+                    bedrock::ConverseModel::Custom { .. }
+                        | bedrock::ConverseModel::Discovered { .. }
+                ) {
+                    models.insert(model.id().to_string(), model);
+                }
+            }
+        } else {
+            for target in runtime_targets.iter().cloned() {
+                let model = target.into_converse_model();
                 models.insert(model.id().to_string(), model);
             }
         }
@@ -888,7 +1223,13 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
-        self.state.update(cx, |state, cx| state.authenticate(cx))
+        let authenticate = self.state.update(cx, |state, cx| state.authenticate(cx));
+        let state = self.state.clone();
+        cx.spawn(async move |cx| {
+            authenticate.await?;
+            state.update(cx, |state, cx| state.refresh_runtime_targets(cx));
+            Ok(())
+        })
     }
 
     fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
@@ -3031,6 +3372,158 @@ mod tests {
 
         cache.invalidate();
         assert!(!Arc::ptr_eq(&cache.cell, &shared.cell));
+    }
+
+    struct FakeRuntimeCatalogSource {
+        foundation_models: Vec<RuntimeFoundationModel>,
+        profile_pages: BTreeMap<Option<String>, RuntimeInferenceProfilePage>,
+    }
+
+    impl RuntimeCatalogSource for FakeRuntimeCatalogSource {
+        fn list_foundation_models(&self) -> BoxFuture<'_, Result<Vec<RuntimeFoundationModel>>> {
+            futures::future::ready(Ok(self.foundation_models.clone())).boxed()
+        }
+
+        fn list_inference_profiles(
+            &self,
+            next_token: Option<String>,
+        ) -> BoxFuture<'_, Result<RuntimeInferenceProfilePage>> {
+            futures::future::ready(
+                self.profile_pages
+                    .get(&next_token)
+                    .cloned()
+                    .with_context(|| format!("missing fake profile page for {next_token:?}")),
+            )
+            .boxed()
+        }
+    }
+
+    fn runtime_foundation_model(
+        model_id: &str,
+        output_modalities: &[&str],
+        lifecycle_status: &str,
+    ) -> RuntimeFoundationModel {
+        RuntimeFoundationModel {
+            model_arn: format!("arn:aws:bedrock:us-east-1::foundation-model/{model_id}"),
+            model_id: model_id.to_string(),
+            model_name: Some(format!("Display {model_id}")),
+            output_modalities: output_modalities
+                .iter()
+                .map(|modality| modality.to_string())
+                .collect(),
+            response_streaming_supported: Some(true),
+            inference_types_supported: vec!["ON_DEMAND".to_string()],
+            lifecycle_status: Some(lifecycle_status.to_string()),
+        }
+    }
+
+    fn runtime_inference_profile(
+        id: &str,
+        base_model_id: &str,
+        kind: &str,
+        status: &str,
+    ) -> RuntimeInferenceProfile {
+        RuntimeInferenceProfile {
+            name: format!("Profile {id}"),
+            arn: format!("arn:aws:bedrock:us-east-1:123456789012:inference-profile/{id}"),
+            model_arns: vec![format!(
+                "arn:aws:bedrock:us-east-1::foundation-model/{base_model_id}"
+            )],
+            id: id.to_string(),
+            status: status.to_string(),
+            kind: kind.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_runtime_discovery_paginates_filters_and_preserves_profile_targets() {
+        let source = FakeRuntimeCatalogSource {
+            foundation_models: vec![
+                runtime_foundation_model(
+                    "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                    &["TEXT"],
+                    "ACTIVE",
+                ),
+                runtime_foundation_model("image-only", &["IMAGE"], "ACTIVE"),
+                runtime_foundation_model("legacy-text", &["TEXT"], "LEGACY"),
+            ],
+            profile_pages: BTreeMap::from([
+                (
+                    None,
+                    RuntimeInferenceProfilePage {
+                        profiles: vec![runtime_inference_profile(
+                            "us.anthropic.claude-sonnet-4-5-v1:0",
+                            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                            "SYSTEM_DEFINED",
+                            "ACTIVE",
+                        )],
+                        next_token: Some("page-2".to_string()),
+                    },
+                ),
+                (
+                    Some("page-2".to_string()),
+                    RuntimeInferenceProfilePage {
+                        profiles: vec![
+                            runtime_inference_profile(
+                                "my-cost-profile",
+                                "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                                "APPLICATION",
+                                "ACTIVE",
+                            ),
+                            runtime_inference_profile(
+                                "inactive-profile",
+                                "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                                "APPLICATION",
+                                "INACTIVE",
+                            ),
+                        ],
+                        next_token: None,
+                    },
+                ),
+            ]),
+        };
+
+        let targets = smol::block_on(discover_runtime_targets(&source)).unwrap();
+
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].kind, BedrockTargetKind::FoundationModel);
+        assert_eq!(targets[1].kind, BedrockTargetKind::SystemInferenceProfile);
+        assert_eq!(
+            targets[2].kind,
+            BedrockTargetKind::ApplicationInferenceProfile
+        );
+        assert_eq!(targets[2].invocation_id, "my-cost-profile");
+        assert_eq!(
+            targets[2].arn.as_deref(),
+            Some("arn:aws:bedrock:us-east-1:123456789012:inference-profile/my-cost-profile")
+        );
+    }
+
+    #[test]
+    fn test_discovered_profile_uses_exact_target_and_known_base_capabilities() {
+        let model = BedrockTargetDescriptor {
+            endpoint: BedrockEndpoint::Runtime,
+            kind: BedrockTargetKind::ApplicationInferenceProfile,
+            id: "bedrock-runtime:profile:cost-center".to_string(),
+            invocation_id: "cost-center".to_string(),
+            arn: Some(
+                "arn:aws:bedrock:us-east-1:123456789012:inference-profile/cost-center".to_string(),
+            ),
+            base_model_id: "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
+            display_name: "Cost center".to_string(),
+        }
+        .into_converse_model();
+
+        assert_eq!(
+            model
+                .cross_region_inference_id("not-a-region", false)
+                .unwrap(),
+            "cost-center"
+        );
+        assert!(model.supports_tool_use());
+        assert!(model.supports_images());
+        assert!(model.supports_thinking());
+        assert_eq!(model.max_token_count(), 1_000_000);
     }
 
     #[test]

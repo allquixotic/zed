@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use strum::EnumIter;
+use strum::{EnumIter, IntoEnumIterator};
 
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -225,6 +225,13 @@ pub enum ConverseModel {
         default_temperature: Option<f32>,
         cache_configuration: Option<BedrockModelCacheConfiguration>,
     },
+    #[serde(skip)]
+    Discovered {
+        id: String,
+        invocation_id: String,
+        display_name: String,
+        base_model: Box<ConverseModel>,
+    },
 }
 
 impl ConverseModel {
@@ -258,6 +265,13 @@ impl ConverseModel {
         } else {
             anyhow::bail!("invalid model id {id}");
         }
+    }
+
+    pub fn from_request_id(id: &str) -> Option<Self> {
+        Self::iter().find(|model| {
+            !matches!(model, Self::Custom { .. } | Self::Discovered { .. })
+                && model.request_id() == id
+        })
     }
 
     pub fn id(&self) -> &str {
@@ -310,6 +324,7 @@ impl ConverseModel {
             Self::DeepSeekV3_1 => "deepseek-v3",
             Self::DeepSeekV3_2 => "deepseek-v3-2",
             Self::Custom { name, .. } => name,
+            Self::Discovered { id, .. } => id,
         }
     }
 
@@ -363,6 +378,7 @@ impl ConverseModel {
             Self::DeepSeekV3_1 => "deepseek.v3-v1:0",
             Self::DeepSeekV3_2 => "deepseek.v3.2",
             Self::Custom { name, .. } => name,
+            Self::Discovered { invocation_id, .. } => invocation_id,
         }
     }
 
@@ -418,6 +434,7 @@ impl ConverseModel {
             Self::Custom {
                 display_name, name, ..
             } => display_name.as_deref().unwrap_or(name.as_str()),
+            Self::Discovered { display_name, .. } => display_name,
         }
     }
 
@@ -455,6 +472,7 @@ impl ConverseModel {
             Self::KimiK2Thinking | Self::KimiK2_5 => 128_000,
             Self::DeepSeekR1 | Self::DeepSeekV3_1 | Self::DeepSeekV3_2 => 128_000,
             Self::Custom { max_tokens, .. } => *max_tokens,
+            Self::Discovered { base_model, .. } => base_model.max_token_count(),
         }
     }
 
@@ -497,6 +515,7 @@ impl ConverseModel {
             Self::Custom {
                 max_output_tokens, ..
             } => max_output_tokens.unwrap_or(4_096),
+            Self::Discovered { base_model, .. } => base_model.max_output_tokens(),
         }
     }
 
@@ -517,6 +536,7 @@ impl ConverseModel {
                 default_temperature,
                 ..
             } => default_temperature.unwrap_or(1.0),
+            Self::Discovered { base_model, .. } => base_model.default_temperature(),
             _ => 1.0,
         }
     }
@@ -551,6 +571,7 @@ impl ConverseModel {
             Self::GLM5 | Self::GLM4_7 | Self::GLM4_7Flash => true,
             Self::KimiK2Thinking | Self::KimiK2_5 => true,
             Self::DeepSeekR1 | Self::DeepSeekV3_1 | Self::DeepSeekV3_2 => true,
+            Self::Discovered { base_model, .. } => base_model.supports_tool_use(),
             _ => false,
         }
     }
@@ -572,6 +593,7 @@ impl ConverseModel {
             Self::PixtralLarge => true,
             Self::Qwen3VL235B => true,
             Self::KimiK2_5 => true,
+            Self::Discovered { base_model, .. } => base_model.supports_images(),
             _ => false,
         }
     }
@@ -593,11 +615,15 @@ impl ConverseModel {
                 cache_configuration,
                 ..
             } => cache_configuration.is_some(),
+            Self::Discovered { base_model, .. } => base_model.supports_caching(),
             _ => false,
         }
     }
 
     pub fn supports_thinking(&self) -> bool {
+        if let Self::Discovered { base_model, .. } = self {
+            return base_model.supports_thinking();
+        }
         matches!(
             self,
             Self::ClaudeFable5
@@ -615,6 +641,9 @@ impl ConverseModel {
     }
 
     pub fn supports_adaptive_thinking(&self) -> bool {
+        if let Self::Discovered { base_model, .. } = self {
+            return base_model.supports_adaptive_thinking();
+        }
         matches!(
             self,
             Self::ClaudeFable5
@@ -627,6 +656,9 @@ impl ConverseModel {
     }
 
     pub fn supports_xhigh_adaptive_thinking(&self) -> bool {
+        if let Self::Discovered { base_model, .. } = self {
+            return base_model.supports_xhigh_adaptive_thinking();
+        }
         matches!(
             self,
             Self::ClaudeFable5 | Self::ClaudeOpus4_8 | Self::ClaudeSonnet5
@@ -652,6 +684,10 @@ impl ConverseModel {
         region: &str,
         allow_global: bool,
     ) -> anyhow::Result<String> {
+        if let Self::Discovered { invocation_id, .. } = self {
+            return Ok(invocation_id.clone());
+        }
+
         let model_id = self.request_id();
 
         let supports_global = matches!(

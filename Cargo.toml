@@ -551,6 +551,7 @@ aws-credential-types = { version = "1.2.8", features = [
     "hardcoded-credentials",
 ] }
 aws-runtime = "1.7.0"
+aws-sdk-bedrock = "=1.122.0"
 aws-sdk-bedrockruntime = { version = "1.112.0", features = [
     "behavior-version-latest",
 ] }
