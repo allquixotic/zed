@@ -5,11 +5,13 @@ use anyhow::{Context as _, Result, anyhow};
 use async_lock::OnceCell;
 use aws_config::stalled_stream_protection::StalledStreamProtectionConfig;
 use aws_config::{BehaviorVersion, Region};
-use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
+use aws_credential_types::provider::ProvideCredentials;
 use aws_credential_types::{Credentials, Token};
 use aws_http_client::AwsHttpClient;
+use aws_runtime::env_config::file::EnvConfigFiles;
 use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
 use aws_sigv4::sign::v4;
+use aws_types::os_shim_internal::{Env as AwsEnv, Fs as AwsFs};
 use bedrock::BedrockSystemContentBlock;
 use bedrock::bedrock_client::Client as BedrockClient;
 use bedrock::bedrock_client::config::timeout::TimeoutConfig;
@@ -170,6 +172,175 @@ impl From<settings::BedrockAuthMethodContent> for BedrockAuthMethod {
             settings::BedrockAuthMethodContent::ApiKey => BedrockAuthMethod::ApiKey,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AwsProfileKind {
+    Credentials,
+    SingleSignOn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AwsProfile {
+    pub name: String,
+    pub kind: AwsProfileKind,
+}
+
+pub async fn load_aws_profiles() -> Result<Vec<AwsProfile>> {
+    let profile_set = aws_config::profile::load(
+        &AwsFs::real(),
+        &AwsEnv::real(),
+        &EnvConfigFiles::default(),
+        None,
+    )
+    .await
+    .context("loading AWS profiles")?;
+    Ok(aws_profiles_from_set(&profile_set))
+}
+
+#[cfg(test)]
+async fn load_aws_profiles_from(
+    filesystem: &AwsFs,
+    environment: &AwsEnv,
+    files: &EnvConfigFiles,
+) -> Result<Vec<AwsProfile>> {
+    let profile_set = aws_config::profile::load(filesystem, environment, files, None)
+        .await
+        .context("loading AWS profiles")?;
+    Ok(aws_profiles_from_set(&profile_set))
+}
+
+fn aws_profiles_from_set(profile_set: &aws_config::profile::ProfileSet) -> Vec<AwsProfile> {
+    let mut profiles = profile_set
+        .profiles()
+        .filter_map(|name| {
+            let profile = profile_set.get_profile(name)?;
+            let kind = if profile.get("sso_session").is_some()
+                || profile.get("sso_start_url").is_some()
+                || profile.get("sso_account_id").is_some()
+            {
+                AwsProfileKind::SingleSignOn
+            } else {
+                AwsProfileKind::Credentials
+            };
+            Some(AwsProfile {
+                name: name.to_string(),
+                kind,
+            })
+        })
+        .collect::<Vec<_>>();
+    profiles.sort_by(|left, right| {
+        (left.name != "default", left.name.as_str())
+            .cmp(&(right.name != "default", right.name.as_str()))
+    });
+    profiles
+}
+
+#[derive(Clone)]
+struct AwsSessionCache {
+    cell: Arc<OnceCell<AwsSession>>,
+}
+
+impl Default for AwsSessionCache {
+    fn default() -> Self {
+        Self {
+            cell: Arc::new(OnceCell::new()),
+        }
+    }
+}
+
+impl AwsSessionCache {
+    fn invalidate(&mut self) {
+        self.cell = Arc::new(OnceCell::new());
+    }
+}
+
+#[derive(Clone)]
+struct AwsSessionConfiguration {
+    auth: Option<BedrockAuth>,
+    endpoint: Option<String>,
+    region: String,
+}
+
+struct AwsSession {
+    sdk_config: aws_types::SdkConfig,
+    runtime_client: BedrockClient,
+    api_key: Option<String>,
+}
+
+impl AwsSession {
+    async fn resolve_mantle_auth(&self) -> Result<MantleAuth> {
+        if let Some(api_key) = &self.api_key {
+            return Ok(MantleAuth::ApiKey {
+                api_key: api_key.clone(),
+            });
+        }
+
+        let credentials_provider = self
+            .sdk_config
+            .credentials_provider()
+            .context("no AWS credentials provider is configured")?;
+        let credentials = credentials_provider
+            .provide_credentials()
+            .await
+            .context("failed to resolve AWS credentials")?;
+        Ok(MantleAuth::SigV4 { credentials })
+    }
+}
+
+async fn build_aws_session(
+    configuration: AwsSessionConfiguration,
+    http_client: AwsHttpClient,
+) -> Result<AwsSession> {
+    let api_key = match &configuration.auth {
+        Some(BedrockAuth::ApiKey { api_key }) => Some(api_key.clone()),
+        _ => None,
+    };
+    let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
+        .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
+        .http_client(http_client)
+        .region(Region::new(configuration.region))
+        .timeout_config(TimeoutConfig::disabled());
+
+    if let Some(endpoint_url) = configuration.endpoint.filter(|url| !url.is_empty()) {
+        config_builder = config_builder.endpoint_url(endpoint_url);
+    }
+
+    match configuration.auth {
+        Some(BedrockAuth::Automatic) | None => {}
+        Some(BedrockAuth::NamedProfile { profile_name })
+        | Some(BedrockAuth::SingleSignOn { profile_name }) => {
+            if !profile_name.is_empty() {
+                config_builder = config_builder.profile_name(profile_name);
+            }
+        }
+        Some(BedrockAuth::IamCredentials {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        }) => {
+            config_builder = config_builder.credentials_provider(Credentials::new(
+                access_key_id,
+                secret_access_key,
+                session_token,
+                None,
+                "zed-bedrock-provider",
+            ));
+        }
+        Some(BedrockAuth::ApiKey { api_key }) => {
+            config_builder = config_builder
+                .auth_scheme_preference(["httpBearerAuth".into()])
+                .token_provider(Token::new(api_key, None));
+        }
+    }
+
+    let sdk_config = config_builder.load().await;
+    let runtime_client = BedrockClient::new(&sdk_config);
+    Ok(AwsSession {
+        sdk_config,
+        runtime_client,
+        api_key,
+    })
 }
 
 fn mantle_protocol_from_settings(value: settings::BedrockMantleProtocolContent) -> MantleProtocol {
@@ -345,10 +516,29 @@ pub struct State {
     /// Whether credentials came from environment variables (only relevant for static credentials)
     credentials_from_env: bool,
     credentials_provider: Arc<dyn CredentialsProvider>,
+    aws_session_cache: AwsSessionCache,
     _subscription: Subscription,
 }
 
 impl State {
+    fn set_auth(&mut self, auth: Option<BedrockAuth>) {
+        if self.auth != auth {
+            self.auth = auth;
+            self.aws_session_cache.invalidate();
+        }
+    }
+
+    fn aws_session_configuration(&self) -> AwsSessionConfiguration {
+        AwsSessionConfiguration {
+            auth: self.auth.clone(),
+            endpoint: self
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.endpoint.clone()),
+            region: self.get_region(),
+        }
+    }
+
     fn reset_auth(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
         let credentials_provider = self.credentials_provider.clone();
         cx.spawn(async move |this, cx| {
@@ -357,7 +547,7 @@ impl State {
                 .await
                 .log_err();
             this.update(cx, |this, cx| {
-                this.auth = None;
+                this.set_auth(None);
                 this.credentials_from_env = false;
                 cx.notify();
             })
@@ -381,7 +571,7 @@ impl State {
                 )
                 .await?;
             this.update(cx, |this, cx| {
-                this.auth = auth;
+                this.set_auth(auth);
                 this.credentials_from_env = false;
                 cx.notify();
             })
@@ -419,7 +609,7 @@ impl State {
 
                 return cx.spawn(async move |this, cx| {
                     this.update(cx, |this, cx| {
-                        this.auth = Some(auth);
+                        this.set_auth(Some(auth));
                         this.credentials_from_env = false;
                         cx.notify();
                     })?;
@@ -480,7 +670,7 @@ impl State {
             // If we got auth from env vars, use it
             if let Some(auth) = auth {
                 this.update(cx, |this, cx| {
-                    this.auth = Some(auth);
+                    this.set_auth(Some(auth));
                     this.credentials_from_env = from_env;
                     cx.notify();
                 })?;
@@ -504,7 +694,7 @@ impl State {
                 .ok_or(AuthenticateError::CredentialsNotFound)?;
 
             this.update(cx, |this, cx| {
-                this.auth = Some(auth);
+                this.set_auth(Some(auth));
                 this.credentials_from_env = false;
                 cx.notify();
             })?;
@@ -560,7 +750,13 @@ impl BedrockLanguageModelProvider {
             settings: Some(AllLanguageModelSettings::get_global(cx).bedrock.clone()),
             credentials_from_env: false,
             credentials_provider,
-            _subscription: cx.observe_global::<SettingsStore>(|_, cx| {
+            aws_session_cache: AwsSessionCache::default(),
+            _subscription: cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
+                let settings = AllLanguageModelSettings::get_global(cx).bedrock.clone();
+                if this.settings.as_ref() != Some(&settings) {
+                    this.settings = Some(settings);
+                    this.aws_session_cache.invalidate();
+                }
                 cx.notify();
             }),
         });
@@ -580,7 +776,6 @@ impl BedrockLanguageModelProvider {
             http_client: self.http_client.clone(),
             handle: self.handle.clone(),
             state: self.state.clone(),
-            client: OnceCell::new(),
             request_limiter: RateLimiter::new(4),
         })
     }
@@ -590,8 +785,8 @@ impl BedrockLanguageModelProvider {
             id: LanguageModelId::from(model.id().to_string()),
             model,
             http_client: self.plain_http_client.clone(),
+            aws_http_client: self.http_client.clone(),
             state: self.state.clone(),
-            credentials_provider: Arc::new(OnceCell::new()),
             request_limiter: RateLimiter::new(4),
         })
     }
@@ -723,71 +918,26 @@ struct BedrockModel {
     model: ConverseModel,
     http_client: AwsHttpClient,
     handle: tokio::runtime::Handle,
-    client: OnceCell<BedrockClient>,
     state: Entity<State>,
     request_limiter: RateLimiter,
 }
 
 impl BedrockModel {
-    fn get_or_init_client(&self, cx: &AsyncApp) -> anyhow::Result<&BedrockClient> {
-        self.client
+    fn get_or_init_client(&self, cx: &AsyncApp) -> Result<BedrockClient> {
+        let (session_cache, configuration) = cx.read_entity(&self.state, |state, _cx| {
+            (
+                state.aws_session_cache.clone(),
+                state.aws_session_configuration(),
+            )
+        });
+        let session = session_cache
+            .cell
             .get_or_try_init_blocking(|| {
-                let (auth, endpoint, region) = cx.read_entity(&self.state, |state, _cx| {
-                    let endpoint = state.settings.as_ref().and_then(|s| s.endpoint.clone());
-                    let region = state.get_region();
-                    (state.auth.clone(), endpoint, region)
-                });
-
-                let mut config_builder = aws_config::defaults(BehaviorVersion::latest())
-                    .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
-                    .http_client(self.http_client.clone())
-                    .region(Region::new(region))
-                    .timeout_config(TimeoutConfig::disabled());
-
-                if let Some(endpoint_url) = endpoint
-                    && !endpoint_url.is_empty()
-                {
-                    config_builder = config_builder.endpoint_url(endpoint_url);
-                }
-
-                match auth {
-                    Some(BedrockAuth::Automatic) | None => {
-                        // Use default AWS credential provider chain
-                    }
-                    Some(BedrockAuth::NamedProfile { profile_name })
-                    | Some(BedrockAuth::SingleSignOn { profile_name }) => {
-                        if !profile_name.is_empty() {
-                            config_builder = config_builder.profile_name(profile_name);
-                        }
-                    }
-                    Some(BedrockAuth::IamCredentials {
-                        access_key_id,
-                        secret_access_key,
-                        session_token,
-                    }) => {
-                        let aws_creds = Credentials::new(
-                            access_key_id,
-                            secret_access_key,
-                            session_token,
-                            None,
-                            "zed-bedrock-provider",
-                        );
-                        config_builder = config_builder.credentials_provider(aws_creds);
-                    }
-                    Some(BedrockAuth::ApiKey { api_key }) => {
-                        config_builder = config_builder
-                            .auth_scheme_preference(["httpBearerAuth".into()]) // https://github.com/smithy-lang/smithy-rs/pull/4241
-                            .token_provider(Token::new(api_key, None));
-                    }
-                }
-
-                let config = self.handle.block_on(config_builder.load());
-
-                anyhow::Ok(BedrockClient::new(&config))
+                self.handle
+                    .block_on(build_aws_session(configuration, self.http_client.clone()))
             })
-            .context("initializing Bedrock client")?;
-
-        self.client.get().context("Bedrock client not initialized")
+            .context("initializing Bedrock session")?;
+        Ok(session.runtime_client.clone())
     }
 
     fn stream_completion(
@@ -798,13 +948,11 @@ impl BedrockModel {
         'static,
         Result<BoxStream<'static, Result<BedrockStreamingResponse, anyhow::Error>>, BedrockError>,
     > {
-        let Ok(runtime_client) = self
-            .get_or_init_client(cx)
-            .cloned()
-            .context("Bedrock client not initialized")
-        else {
-            return futures::future::ready(Err(BedrockError::Other(anyhow!("App state dropped"))))
-                .boxed();
+        let runtime_client = match self.get_or_init_client(cx) {
+            Ok(client) => client,
+            Err(error) => {
+                return futures::future::ready(Err(BedrockError::Other(error))).boxed();
+            }
         };
         let extra_headers = self.state.read_with(cx, |_, cx| {
             AllLanguageModelSettings::get_global(cx)
@@ -1093,84 +1241,6 @@ fn map_mantle_error(model: &MantleModel, error: RequestError) -> LanguageModelCo
         };
     }
     error.into()
-}
-
-/// Resolves an AWS credentials provider for profile/SSO/automatic auth.
-/// Cached in `cell` since building it may read config files from disk;
-/// credentials themselves are still re-resolved on every call. Async so this
-/// never blocks the foreground thread (unlike `BedrockModel::get_or_init_client`).
-async fn resolve_mantle_credentials_provider(
-    cell: &OnceCell<SharedCredentialsProvider>,
-    profile_name: Option<String>,
-    region: String,
-) -> Result<SharedCredentialsProvider> {
-    let provider = cell
-        .get_or_try_init(move || async move {
-            let mut config_builder =
-                aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region));
-
-            if let Some(profile_name) = profile_name.filter(|name| !name.is_empty()) {
-                config_builder = config_builder.profile_name(profile_name);
-            }
-
-            let config = config_builder.load().await;
-            config
-                .credentials_provider()
-                .context("no AWS credentials provider is configured")
-        })
-        .await
-        .context("resolving AWS credentials for Bedrock Mantle")?;
-    Ok(provider.clone())
-}
-
-/// Resolves provider settings into concrete Mantle request auth. A configured
-/// Bedrock API key is sent as bearer auth; every AWS-credential-based method
-/// signs the Mantle HTTP request directly with SigV4.
-async fn resolve_mantle_auth(
-    credentials_provider: Arc<OnceCell<SharedCredentialsProvider>>,
-    auth: Option<BedrockAuth>,
-    region: String,
-) -> Result<MantleAuth> {
-    match auth {
-        Some(BedrockAuth::ApiKey { api_key }) => Ok(MantleAuth::ApiKey { api_key }),
-        Some(BedrockAuth::IamCredentials {
-            access_key_id,
-            secret_access_key,
-            session_token,
-        }) => Ok(MantleAuth::SigV4 {
-            credentials: Credentials::new(
-                access_key_id,
-                secret_access_key,
-                session_token,
-                None,
-                "zed-bedrock-provider",
-            ),
-        }),
-        Some(BedrockAuth::NamedProfile { profile_name })
-        | Some(BedrockAuth::SingleSignOn { profile_name }) => {
-            let provider = resolve_mantle_credentials_provider(
-                &credentials_provider,
-                Some(profile_name),
-                region.clone(),
-            )
-            .await?;
-            let credentials = provider
-                .provide_credentials()
-                .await
-                .context("failed to resolve AWS credentials")?;
-            Ok(MantleAuth::SigV4 { credentials })
-        }
-        Some(BedrockAuth::Automatic) | None => {
-            let provider =
-                resolve_mantle_credentials_provider(&credentials_provider, None, region.clone())
-                    .await?;
-            let credentials = provider
-                .provide_credentials()
-                .await
-                .context("failed to resolve AWS credentials")?;
-            Ok(MantleAuth::SigV4 { credentials })
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -1714,8 +1784,8 @@ struct BedrockMantleModel {
     id: LanguageModelId,
     model: MantleModel,
     http_client: Arc<dyn HttpClient>,
+    aws_http_client: AwsHttpClient,
     state: Entity<State>,
-    credentials_provider: Arc<OnceCell<SharedCredentialsProvider>>,
     request_limiter: RateLimiter,
 }
 
@@ -1732,10 +1802,14 @@ impl BedrockMantleModel {
         Event: Send + 'static,
     {
         let http_client = self.http_client.clone();
+        let aws_http_client = self.aws_http_client.clone();
         let model = self.model.clone();
-        let credentials_provider = self.credentials_provider.clone();
-        let (auth, region) = cx.read_entity(&self.state, |state, _cx| {
-            (state.auth.clone(), state.get_region())
+        let (session_cache, configuration, region) = cx.read_entity(&self.state, |state, _cx| {
+            (
+                state.aws_session_cache.clone(),
+                state.aws_session_configuration(),
+                state.get_region(),
+            )
         });
         let url = format!("{}/{}", mantle_endpoint_url(&region), endpoint);
         let extra_headers = cx.read_entity(&self.state, |_, cx| {
@@ -1745,10 +1819,14 @@ impl BedrockMantleModel {
                 .clone()
         });
         let provider_name = PROVIDER_NAME.0.to_string();
-        let auth_task = Tokio::spawn_result(
-            cx,
-            resolve_mantle_auth(credentials_provider, auth, region.clone()),
-        );
+        let auth_task = Tokio::spawn_result(cx, async move {
+            let session = session_cache
+                .cell
+                .get_or_try_init(|| build_aws_session(configuration, aws_http_client))
+                .await
+                .context("initializing Bedrock session")?;
+            session.resolve_mantle_auth().await
+        });
 
         let future = self.request_limiter.stream(async move {
             let auth = auth_task
@@ -2901,6 +2979,58 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_aws_profile_discovery_merges_and_classifies_profiles() {
+        use aws_runtime::env_config::file::EnvConfigFileKind;
+
+        let files = EnvConfigFiles::builder()
+            .with_contents(
+                EnvConfigFileKind::Config,
+                "[profile sso]\nsso_session = company\nsso_account_id = 123456789012\n\
+                 [profile static]\nregion = us-west-2\n",
+            )
+            .with_contents(
+                EnvConfigFileKind::Credentials,
+                "[default]\naws_access_key_id = default\n\
+                 [static]\naws_access_key_id = static\n",
+            )
+            .build();
+        let profiles = smol::block_on(load_aws_profiles_from(
+            &AwsFs::from_slice(&[]),
+            &AwsEnv::from_slice(&[]),
+            &files,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            profiles,
+            vec![
+                AwsProfile {
+                    name: "default".to_string(),
+                    kind: AwsProfileKind::Credentials,
+                },
+                AwsProfile {
+                    name: "sso".to_string(),
+                    kind: AwsProfileKind::SingleSignOn,
+                },
+                AwsProfile {
+                    name: "static".to_string(),
+                    kind: AwsProfileKind::Credentials,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_aws_session_cache_shares_until_invalidated() {
+        let mut cache = AwsSessionCache::default();
+        let shared = cache.clone();
+        assert!(Arc::ptr_eq(&cache.cell, &shared.cell));
+
+        cache.invalidate();
+        assert!(!Arc::ptr_eq(&cache.cell, &shared.cell));
     }
 
     #[test]
