@@ -862,14 +862,24 @@ pub enum MantleProtocol {
     ChatCompletions,
     /// The OpenAI Responses API (`/responses`).
     Responses,
+    /// The Anthropic Messages API (`/anthropic/v1/messages`).
+    AnthropicMessages,
 }
 
-/// Models only reachable through the `bedrock-mantle` endpoint's
-/// OpenAI-compatible APIs, i.e. with no `Converse`/`Invoke` support on
-/// `bedrock-runtime`.
+/// Models routed through the `bedrock-mantle` endpoint.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, EnumIter)]
 pub enum MantleModel {
+    #[serde(rename = "bedrock-mantle/claude-mythos-5")]
+    ClaudeMythos5,
+    #[serde(rename = "bedrock-mantle/claude-fable-5")]
+    ClaudeFable5,
+    #[serde(rename = "bedrock-mantle/claude-sonnet-5")]
+    ClaudeSonnet5,
+    #[serde(rename = "bedrock-mantle/claude-opus-4-8")]
+    ClaudeOpus4_8,
+    #[serde(rename = "bedrock-mantle/claude-opus-4-7")]
+    ClaudeOpus4_7,
     #[serde(rename = "gpt-5.6-sol")]
     Gpt5_6Sol,
     #[serde(rename = "gpt-5.6-terra")]
@@ -899,6 +909,11 @@ impl MantleModel {
     /// The model id Zed uses internally (also used as the `name` in settings).
     pub fn id(&self) -> &str {
         match self {
+            Self::ClaudeMythos5 => "bedrock-mantle/claude-mythos-5",
+            Self::ClaudeFable5 => "bedrock-mantle/claude-fable-5",
+            Self::ClaudeSonnet5 => "bedrock-mantle/claude-sonnet-5",
+            Self::ClaudeOpus4_8 => "bedrock-mantle/claude-opus-4-8",
+            Self::ClaudeOpus4_7 => "bedrock-mantle/claude-opus-4-7",
             Self::Gpt5_6Sol => "gpt-5.6-sol",
             Self::Gpt5_6Terra => "gpt-5.6-terra",
             Self::Gpt5_6Luna => "gpt-5.6-luna",
@@ -912,6 +927,11 @@ impl MantleModel {
     /// The model id as expected in Bedrock Mantle request bodies, e.g. `openai.gpt-5.5`.
     pub fn request_id(&self) -> &str {
         match self {
+            Self::ClaudeMythos5 => "anthropic.claude-mythos-5",
+            Self::ClaudeFable5 => "anthropic.claude-fable-5",
+            Self::ClaudeSonnet5 => "anthropic.claude-sonnet-5",
+            Self::ClaudeOpus4_8 => "anthropic.claude-opus-4-8",
+            Self::ClaudeOpus4_7 => "anthropic.claude-opus-4-7",
             Self::Gpt5_6Sol => "openai.gpt-5.6-sol",
             Self::Gpt5_6Terra => "openai.gpt-5.6-terra",
             Self::Gpt5_6Luna => "openai.gpt-5.6-luna",
@@ -924,6 +944,11 @@ impl MantleModel {
 
     pub fn display_name(&self) -> &str {
         match self {
+            Self::ClaudeMythos5 => "Claude Mythos 5 (Mantle)",
+            Self::ClaudeFable5 => "Claude Fable 5 (Mantle)",
+            Self::ClaudeSonnet5 => "Claude Sonnet 5 (Mantle)",
+            Self::ClaudeOpus4_8 => "Claude Opus 4.8 (Mantle)",
+            Self::ClaudeOpus4_7 => "Claude Opus 4.7 (Mantle)",
             Self::Gpt5_6Sol => "GPT-5.6 Sol",
             Self::Gpt5_6Terra => "GPT-5.6 Terra",
             Self::Gpt5_6Luna => "GPT-5.6 Luna",
@@ -939,6 +964,11 @@ impl MantleModel {
     /// Which OpenAI-compatible API this model must be called through.
     pub fn protocol(&self) -> MantleProtocol {
         match self {
+            Self::ClaudeMythos5
+            | Self::ClaudeFable5
+            | Self::ClaudeSonnet5
+            | Self::ClaudeOpus4_8
+            | Self::ClaudeOpus4_7 => MantleProtocol::AnthropicMessages,
             Self::Gpt5_6Sol
             | Self::Gpt5_6Terra
             | Self::Gpt5_6Luna
@@ -951,6 +981,11 @@ impl MantleModel {
 
     pub fn max_token_count(&self) -> u64 {
         match self {
+            Self::ClaudeMythos5
+            | Self::ClaudeFable5
+            | Self::ClaudeSonnet5
+            | Self::ClaudeOpus4_8
+            | Self::ClaudeOpus4_7 => 1_000_000,
             Self::Gpt5_6Sol
             | Self::Gpt5_6Terra
             | Self::Gpt5_6Luna
@@ -963,6 +998,11 @@ impl MantleModel {
 
     pub fn max_output_tokens(&self) -> u64 {
         match self {
+            Self::ClaudeMythos5
+            | Self::ClaudeFable5
+            | Self::ClaudeSonnet5
+            | Self::ClaudeOpus4_8
+            | Self::ClaudeOpus4_7 => 128_000,
             // AWS doesn't document a hard cap for the GPT-5.x models on Mantle.
             Self::Gpt5_6Sol
             | Self::Gpt5_6Terra
@@ -978,7 +1018,12 @@ impl MantleModel {
 
     pub fn supports_tools(&self) -> bool {
         match self {
-            Self::Gpt5_6Sol
+            Self::ClaudeMythos5
+            | Self::ClaudeFable5
+            | Self::ClaudeSonnet5
+            | Self::ClaudeOpus4_8
+            | Self::ClaudeOpus4_7
+            | Self::Gpt5_6Sol
             | Self::Gpt5_6Terra
             | Self::Gpt5_6Luna
             | Self::Gpt5_5
@@ -990,7 +1035,12 @@ impl MantleModel {
 
     pub fn supports_images(&self) -> bool {
         match self {
-            Self::Gpt5_6Sol
+            Self::ClaudeMythos5
+            | Self::ClaudeFable5
+            | Self::ClaudeSonnet5
+            | Self::ClaudeOpus4_8
+            | Self::ClaudeOpus4_7
+            | Self::Gpt5_6Sol
             | Self::Gpt5_6Terra
             | Self::Gpt5_6Luna
             | Self::Gpt5_5
@@ -1004,7 +1054,12 @@ impl MantleModel {
 
     pub fn supports_thinking(&self) -> bool {
         match self {
-            Self::Gpt5_6Sol
+            Self::ClaudeMythos5
+            | Self::ClaudeFable5
+            | Self::ClaudeSonnet5
+            | Self::ClaudeOpus4_8
+            | Self::ClaudeOpus4_7
+            | Self::Gpt5_6Sol
             | Self::Gpt5_6Terra
             | Self::Gpt5_6Luna
             | Self::Gpt5_5
@@ -1065,6 +1120,52 @@ mod tests {
             assert_eq!(model.request_id(), request_id);
             assert_eq!(model.display_name(), display_name);
             assert_eq!(model.max_token_count(), 272_000);
+            assert!(model.supports_tools());
+            assert!(model.supports_images());
+            assert!(model.supports_thinking());
+        }
+    }
+
+    #[test]
+    fn test_anthropic_mantle_model_metadata() {
+        for (model, id, request_id, display_name) in [
+            (
+                MantleModel::ClaudeMythos5,
+                "bedrock-mantle/claude-mythos-5",
+                "anthropic.claude-mythos-5",
+                "Claude Mythos 5 (Mantle)",
+            ),
+            (
+                MantleModel::ClaudeFable5,
+                "bedrock-mantle/claude-fable-5",
+                "anthropic.claude-fable-5",
+                "Claude Fable 5 (Mantle)",
+            ),
+            (
+                MantleModel::ClaudeSonnet5,
+                "bedrock-mantle/claude-sonnet-5",
+                "anthropic.claude-sonnet-5",
+                "Claude Sonnet 5 (Mantle)",
+            ),
+            (
+                MantleModel::ClaudeOpus4_8,
+                "bedrock-mantle/claude-opus-4-8",
+                "anthropic.claude-opus-4-8",
+                "Claude Opus 4.8 (Mantle)",
+            ),
+            (
+                MantleModel::ClaudeOpus4_7,
+                "bedrock-mantle/claude-opus-4-7",
+                "anthropic.claude-opus-4-7",
+                "Claude Opus 4.7 (Mantle)",
+            ),
+        ] {
+            assert_eq!(model.id(), id);
+            assert_eq!(model.request_id(), request_id);
+            assert_eq!(model.display_name(), display_name);
+            assert_eq!(model.protocol(), MantleProtocol::AnthropicMessages);
+            assert_eq!(model.max_token_count(), 1_000_000);
+            assert_eq!(model.max_output_tokens(), 128_000);
             assert!(model.supports_tools());
             assert!(model.supports_images());
             assert!(model.supports_thinking());
