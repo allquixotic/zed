@@ -903,9 +903,28 @@ pub enum MantleModel {
         supports_images: bool,
         supports_thinking: bool,
     },
+    #[serde(skip)]
+    Discovered {
+        id: String,
+        request_id: String,
+        display_name: String,
+        protocol: MantleProtocol,
+        max_tokens: u64,
+        max_output_tokens: u64,
+        supports_tools: bool,
+        supports_images: bool,
+        supports_thinking: bool,
+    },
 }
 
 impl MantleModel {
+    pub fn from_request_id(id: &str) -> Option<Self> {
+        Self::iter().find(|model| {
+            !matches!(model, Self::Custom { .. } | Self::Discovered { .. })
+                && model.request_id() == id
+        })
+    }
+
     /// The model id Zed uses internally (also used as the `name` in settings).
     pub fn id(&self) -> &str {
         match self {
@@ -921,6 +940,7 @@ impl MantleModel {
             Self::Gpt5_4 => "gpt-5.4",
             Self::Grok4_3 => "grok-4.3",
             Self::Custom { name, .. } => name,
+            Self::Discovered { id, .. } => id,
         }
     }
 
@@ -939,6 +959,7 @@ impl MantleModel {
             Self::Gpt5_4 => "openai.gpt-5.4",
             Self::Grok4_3 => "xai.grok-4.3",
             Self::Custom { name, .. } => name,
+            Self::Discovered { request_id, .. } => request_id,
         }
     }
 
@@ -958,6 +979,7 @@ impl MantleModel {
             Self::Custom {
                 display_name, name, ..
             } => display_name.as_deref().unwrap_or(name.as_str()),
+            Self::Discovered { display_name, .. } => display_name,
         }
     }
 
@@ -976,6 +998,7 @@ impl MantleModel {
             | Self::Gpt5_4
             | Self::Grok4_3 => MantleProtocol::Responses,
             Self::Custom { protocol, .. } => *protocol,
+            Self::Discovered { protocol, .. } => *protocol,
         }
     }
 
@@ -993,6 +1016,7 @@ impl MantleModel {
             | Self::Gpt5_4 => 272_000,
             Self::Grok4_3 => 1_000_000,
             Self::Custom { max_tokens, .. } => *max_tokens,
+            Self::Discovered { max_tokens, .. } => *max_tokens,
         }
     }
 
@@ -1013,6 +1037,9 @@ impl MantleModel {
             Self::Custom {
                 max_output_tokens, ..
             } => max_output_tokens.unwrap_or(4_096),
+            Self::Discovered {
+                max_output_tokens, ..
+            } => *max_output_tokens,
         }
     }
 
@@ -1030,6 +1057,7 @@ impl MantleModel {
             | Self::Gpt5_4
             | Self::Grok4_3 => true,
             Self::Custom { supports_tools, .. } => *supports_tools,
+            Self::Discovered { supports_tools, .. } => *supports_tools,
         }
     }
 
@@ -1049,6 +1077,9 @@ impl MantleModel {
             Self::Custom {
                 supports_images, ..
             } => *supports_images,
+            Self::Discovered {
+                supports_images, ..
+            } => *supports_images,
         }
     }
 
@@ -1066,6 +1097,9 @@ impl MantleModel {
             | Self::Gpt5_4
             | Self::Grok4_3 => true,
             Self::Custom {
+                supports_thinking, ..
+            } => *supports_thinking,
+            Self::Discovered {
                 supports_thinking, ..
             } => *supports_thinking,
         }
@@ -1179,9 +1213,12 @@ mod tests {
 
         let mut ids = HashSet::new();
         let mut request_ids = HashSet::new();
-        for model in
-            MantleModel::iter().filter(|model| !matches!(model, MantleModel::Custom { .. }))
-        {
+        for model in MantleModel::iter().filter(|model| {
+            !matches!(
+                model,
+                MantleModel::Custom { .. } | MantleModel::Discovered { .. }
+            )
+        }) {
             assert!(
                 ids.insert(model.id().to_string()),
                 "duplicate MantleModel id: {}",
