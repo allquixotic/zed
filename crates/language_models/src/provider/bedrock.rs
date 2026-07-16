@@ -29,6 +29,7 @@ use bedrock::{
 };
 use collections::{BTreeMap, HashMap};
 use credentials_provider::CredentialsProvider;
+use fs::Fs;
 use futures::{
     AsyncBufReadExt, AsyncReadExt, FutureExt, Stream, StreamExt, future::BoxFuture, io::BufReader,
     stream::BoxStream,
@@ -57,12 +58,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use settings::{
     BedrockAvailableModel as AvailableModel, BedrockMantleAvailableModel as MantleAvailableModel,
-    Settings, SettingsStore,
+    Settings, SettingsStore, update_settings_file,
 };
 use std::sync::LazyLock;
 use std::time::SystemTime;
 use strum::{EnumIter, IntoEnumIterator, IntoStaticStr};
-use ui::{ButtonLink, ConfiguredApiCard, Divider, List, ListBulletItem, prelude::*};
+use ui::{
+    ButtonLink, ConfiguredApiCard, ContextMenu, ContextMenuEntry, Divider, DropdownMenu,
+    DropdownStyle, IconPosition, List, ListBulletItem, prelude::*,
+};
 use ui_input::InputField;
 use util::ResultExt;
 
@@ -968,6 +972,7 @@ pub struct State {
     settings: Option<AmazonBedrockSettings>,
     /// Whether credentials came from environment variables (only relevant for static credentials)
     credentials_from_env: bool,
+    configuration_revision: u64,
     credentials_provider: Arc<dyn CredentialsProvider>,
     aws_http_client: AwsHttpClient,
     plain_http_client: Arc<dyn HttpClient>,
@@ -977,7 +982,9 @@ pub struct State {
     mantle_targets: Vec<BedrockTargetDescriptor>,
     mantle_discovery_error: Option<String>,
     mantle_endpoint_available: Option<bool>,
+    discovery_in_progress: bool,
     discovery_task: Task<()>,
+    settings_authentication_task: Task<()>,
     _subscription: Subscription,
 }
 
@@ -996,6 +1003,7 @@ impl State {
         self.mantle_targets.clear();
         self.mantle_discovery_error = None;
         self.mantle_endpoint_available = None;
+        self.discovery_in_progress = false;
         self.discovery_task = Task::ready(());
     }
 
@@ -1018,6 +1026,7 @@ impl State {
         self.runtime_discovery_error = None;
         self.mantle_discovery_error = None;
         self.mantle_endpoint_available = Some(mantle_endpoint_available);
+        self.discovery_in_progress = true;
         self.discovery_task = cx.spawn(async move |this, cx| {
             let session = session_cache
                 .cell
@@ -1071,6 +1080,7 @@ impl State {
                         this.mantle_discovery_error = Some(format!("{error:#}"));
                     }
                 }
+                this.discovery_in_progress = false;
                 cx.notify();
             }) {
                 log::debug!("Bedrock provider was dropped during model discovery: {error:#}");
@@ -1124,6 +1134,7 @@ impl State {
             this.update(cx, |this, cx| {
                 this.set_auth(auth);
                 this.credentials_from_env = false;
+                this.refresh_targets(cx);
                 cx.notify();
             })
         })
@@ -1134,10 +1145,15 @@ impl State {
     }
 
     /// Resolve authentication. Settings take priority over UX-provided credentials.
-    fn authenticate(&self, cx: &mut Context<Self>) -> Task<Result<(), AuthenticateError>> {
+    fn authenticate_with_invalidation(
+        &self,
+        invalidate_session: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), AuthenticateError>> {
         if self.is_authenticated() {
             return Task::ready(Ok(()));
         }
+        let configuration_revision = self.configuration_revision;
 
         // Step 1: Check if settings specify an auth method (enterprise control)
         if let Some(settings) = &self.settings {
@@ -1154,13 +1170,24 @@ impl State {
                     BedrockAuthMethod::ApiKey => {
                         // ApiKey method means "use static credentials from keychain/env"
                         // Fall through to load them below
-                        return self.load_static_credentials(cx);
+                        return self.load_static_credentials(
+                            invalidate_session,
+                            configuration_revision,
+                            cx,
+                        );
                     }
                 };
 
                 return cx.spawn(async move |this, cx| {
                     this.update(cx, |this, cx| {
-                        this.set_auth(Some(auth));
+                        if this.configuration_revision != configuration_revision {
+                            return;
+                        }
+                        if invalidate_session {
+                            this.set_auth(Some(auth));
+                        } else {
+                            this.auth = Some(auth);
+                        }
                         this.credentials_from_env = false;
                         cx.notify();
                     })?;
@@ -1169,13 +1196,39 @@ impl State {
             }
         }
 
+        if let Some(profile_name) = ZED_AWS_PROFILE_VAR
+            .value
+            .as_deref()
+            .filter(|profile_name| !profile_name.is_empty())
+            .map(str::to_string)
+        {
+            return cx.spawn(async move |this, cx| {
+                this.update(cx, |this, cx| {
+                    if this.configuration_revision != configuration_revision {
+                        return;
+                    }
+                    let auth = BedrockAuth::NamedProfile { profile_name };
+                    if invalidate_session {
+                        this.set_auth(Some(auth));
+                    } else {
+                        this.auth = Some(auth);
+                    }
+                    this.credentials_from_env = false;
+                    cx.notify();
+                })?;
+                Ok(())
+            });
+        }
+
         // Step 2: No settings auth method - try to load static credentials
-        self.load_static_credentials(cx)
+        self.load_static_credentials(invalidate_session, configuration_revision, cx)
     }
 
     /// Load static credentials from environment variables or keychain.
     fn load_static_credentials(
         &self,
+        invalidate_session: bool,
+        configuration_revision: u64,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), AuthenticateError>> {
         let credentials_provider = self.credentials_provider.clone();
@@ -1221,7 +1274,14 @@ impl State {
             // If we got auth from env vars, use it
             if let Some(auth) = auth {
                 this.update(cx, |this, cx| {
-                    this.set_auth(Some(auth));
+                    if this.configuration_revision != configuration_revision {
+                        return;
+                    }
+                    if invalidate_session {
+                        this.set_auth(Some(auth));
+                    } else {
+                        this.auth = Some(auth);
+                    }
                     this.credentials_from_env = from_env;
                     cx.notify();
                 })?;
@@ -1245,11 +1305,36 @@ impl State {
                 .ok_or(AuthenticateError::CredentialsNotFound)?;
 
             this.update(cx, |this, cx| {
-                this.set_auth(Some(auth));
+                if this.configuration_revision != configuration_revision {
+                    return;
+                }
+                if invalidate_session {
+                    this.set_auth(Some(auth));
+                } else {
+                    this.auth = Some(auth);
+                }
                 this.credentials_from_env = false;
                 cx.notify();
             })?;
 
+            Ok(())
+        })
+    }
+
+    fn authenticate_and_refresh(
+        &self,
+        invalidate_session: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(), AuthenticateError>> {
+        let configuration_revision = self.configuration_revision;
+        let authenticate = self.authenticate_with_invalidation(invalidate_session, cx);
+        cx.spawn(async move |this, cx| {
+            authenticate.await?;
+            this.update(cx, |this, cx| {
+                if this.configuration_revision == configuration_revision {
+                    this.refresh_targets(cx);
+                }
+            })?;
             Ok(())
         })
     }
@@ -1301,6 +1386,7 @@ impl BedrockLanguageModelProvider {
             auth: None,
             settings: Some(AllLanguageModelSettings::get_global(cx).bedrock.clone()),
             credentials_from_env: false,
+            configuration_revision: 0,
             credentials_provider,
             aws_http_client: aws_http_client.clone(),
             plain_http_client: http_client.clone(),
@@ -1310,14 +1396,28 @@ impl BedrockLanguageModelProvider {
             mantle_targets: Vec::new(),
             mantle_discovery_error: None,
             mantle_endpoint_available: None,
+            discovery_in_progress: false,
             discovery_task: Task::ready(()),
+            settings_authentication_task: Task::ready(()),
             _subscription: cx.observe_global::<SettingsStore>(|this: &mut State, cx| {
                 let settings = AllLanguageModelSettings::get_global(cx).bedrock.clone();
                 if this.settings.as_ref() != Some(&settings) {
                     this.settings = Some(settings);
+                    this.auth = None;
+                    this.credentials_from_env = false;
+                    this.configuration_revision = this.configuration_revision.wrapping_add(1);
                     this.aws_session_cache.invalidate();
                     this.reset_discovery();
-                    this.refresh_targets(cx);
+                    let authenticate = this.authenticate_and_refresh(false, cx);
+                    this.settings_authentication_task =
+                        cx.spawn(async move |_, _| match authenticate.await {
+                            Ok(()) | Err(AuthenticateError::CredentialsNotFound) => {}
+                            Err(error) => {
+                                log::warn!(
+                                    "Failed to apply updated Amazon Bedrock settings: {error}"
+                                );
+                            }
+                        });
                 }
                 cx.notify();
             }),
@@ -1494,13 +1594,8 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
     }
 
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>> {
-        let authenticate = self.state.update(cx, |state, cx| state.authenticate(cx));
-        let state = self.state.clone();
-        cx.spawn(async move |cx| {
-            authenticate.await?;
-            state.update(cx, |state, cx| state.refresh_targets(cx));
-            Ok(())
-        })
+        self.state
+            .update(cx, |state, cx| state.authenticate_and_refresh(true, cx))
     }
 
     fn settings_view(&self, _cx: &mut App) -> Option<ProviderSettingsView> {
@@ -3269,8 +3364,111 @@ struct ConfigurationView {
     bearer_token_editor: Entity<InputField>,
     state: Entity<State>,
     load_credentials_task: Option<Task<()>>,
+    aws_profiles: Vec<AwsProfile>,
+    load_profiles_task: Option<Task<()>>,
+    authentication_error: Option<SharedString>,
+    profile_error: Option<SharedString>,
     focus_handle: FocusHandle,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BedrockAuthSelection {
+    Automatic,
+    NamedProfile,
+    SingleSignOn,
+    StaticCredentials,
+}
+
+impl BedrockAuthSelection {
+    const ALL: [Self; 4] = [
+        Self::Automatic,
+        Self::NamedProfile,
+        Self::SingleSignOn,
+        Self::StaticCredentials,
+    ];
+
+    fn from_state(state: &State) -> Self {
+        match state
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.authentication_method.as_ref())
+        {
+            Some(BedrockAuthMethod::Automatic) => Self::Automatic,
+            Some(BedrockAuthMethod::NamedProfile) => Self::NamedProfile,
+            Some(BedrockAuthMethod::SingleSignOn) => Self::SingleSignOn,
+            Some(BedrockAuthMethod::ApiKey) => Self::StaticCredentials,
+            None => match state.auth {
+                Some(BedrockAuth::Automatic) => Self::Automatic,
+                Some(BedrockAuth::NamedProfile { .. }) => Self::NamedProfile,
+                Some(BedrockAuth::SingleSignOn { .. }) => Self::SingleSignOn,
+                _ => Self::StaticCredentials,
+            },
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "Automatic (AWS credential chain)",
+            Self::NamedProfile => "AWS profile",
+            Self::SingleSignOn => "AWS SSO profile",
+            Self::StaticCredentials => "Static credentials or API key",
+        }
+    }
+
+    fn settings_value(self) -> settings::BedrockAuthMethodContent {
+        match self {
+            Self::Automatic => settings::BedrockAuthMethodContent::Automatic,
+            Self::NamedProfile => settings::BedrockAuthMethodContent::NamedProfile,
+            Self::SingleSignOn => settings::BedrockAuthMethodContent::SingleSignOn,
+            Self::StaticCredentials => settings::BedrockAuthMethodContent::ApiKey,
+        }
+    }
+
+    fn profile_kind(self) -> Option<AwsProfileKind> {
+        match self {
+            Self::NamedProfile => Some(AwsProfileKind::Credentials),
+            Self::SingleSignOn => Some(AwsProfileKind::SingleSignOn),
+            Self::Automatic | Self::StaticCredentials => None,
+        }
+    }
+}
+
+const BEDROCK_REGIONS: &[(&str, &str)] = &[
+    ("us-east-1", "US East (N. Virginia)"),
+    ("us-east-2", "US East (Ohio)"),
+    ("us-west-1", "US West (N. California)"),
+    ("us-west-2", "US West (Oregon)"),
+    ("ca-central-1", "Canada (Central)"),
+    ("ca-west-1", "Canada West (Calgary)"),
+    ("eu-central-1", "Europe (Frankfurt)"),
+    ("eu-central-2", "Europe (Zurich)"),
+    ("eu-north-1", "Europe (Stockholm)"),
+    ("eu-south-1", "Europe (Milan)"),
+    ("eu-south-2", "Europe (Spain)"),
+    ("eu-west-1", "Europe (Ireland)"),
+    ("eu-west-2", "Europe (London)"),
+    ("eu-west-3", "Europe (Paris)"),
+    ("ap-east-2", "Asia Pacific (Taipei)"),
+    ("ap-northeast-1", "Asia Pacific (Tokyo)"),
+    ("ap-northeast-2", "Asia Pacific (Seoul)"),
+    ("ap-northeast-3", "Asia Pacific (Osaka)"),
+    ("ap-south-1", "Asia Pacific (Mumbai)"),
+    ("ap-south-2", "Asia Pacific (Hyderabad)"),
+    ("ap-southeast-1", "Asia Pacific (Singapore)"),
+    ("ap-southeast-2", "Asia Pacific (Sydney)"),
+    ("ap-southeast-3", "Asia Pacific (Jakarta)"),
+    ("ap-southeast-4", "Asia Pacific (Melbourne)"),
+    ("ap-southeast-5", "Asia Pacific (Malaysia)"),
+    ("ap-southeast-6", "Asia Pacific (New Zealand)"),
+    ("ap-southeast-7", "Asia Pacific (Thailand)"),
+    ("il-central-1", "Israel (Tel Aviv)"),
+    ("me-central-1", "Middle East (UAE)"),
+    ("me-south-1", "Middle East (Bahrain)"),
+    ("af-south-1", "Africa (Cape Town)"),
+    ("sa-east-1", "South America (São Paulo)"),
+    ("us-gov-east-1", "AWS GovCloud (US-East)"),
+    ("us-gov-west-1", "AWS GovCloud (US-West)"),
+];
 
 impl ConfigurationView {
     const PLACEHOLDER_ACCESS_KEY_ID_TEXT: &'static str = "XXXXXXXXXXXXXXXX";
@@ -3282,7 +3480,10 @@ impl ConfigurationView {
     fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
 
-        cx.observe(&state, |_, _, cx| {
+        cx.observe(&state, |this, state, cx| {
+            if state.read(cx).is_authenticated() {
+                this.authentication_error = None;
+            }
             cx.notify();
         })
         .detach();
@@ -3290,44 +3491,67 @@ impl ConfigurationView {
         let access_key_id_editor = cx.new(|cx| {
             InputField::new(window, cx, Self::PLACEHOLDER_ACCESS_KEY_ID_TEXT)
                 .label("Access Key ID")
-                .tab_index(0)
+                .tab_index(3)
                 .tab_stop(true)
         });
 
         let secret_access_key_editor = cx.new(|cx| {
             InputField::new(window, cx, Self::PLACEHOLDER_SECRET_ACCESS_KEY_TEXT)
                 .label("Secret Access Key")
-                .tab_index(1)
+                .tab_index(4)
                 .tab_stop(true)
         });
 
         let session_token_editor = cx.new(|cx| {
             InputField::new(window, cx, Self::PLACEHOLDER_SESSION_TOKEN_TEXT)
                 .label("Session Token (Optional)")
-                .tab_index(2)
+                .tab_index(5)
                 .tab_stop(true)
         });
 
         let bearer_token_editor = cx.new(|cx| {
             InputField::new(window, cx, Self::PLACEHOLDER_BEARER_TOKEN_TEXT)
                 .label("Bedrock API Key")
-                .tab_index(3)
+                .tab_index(6)
                 .tab_stop(true)
         });
 
         let load_credentials_task = Some(cx.spawn({
             let state = state.clone();
             async move |this, cx| {
-                if let Some(task) = Some(state.update(cx, |state, cx| state.authenticate(cx))) {
-                    // We don't log an error, because "not signed in" is also an error.
-                    let _ = task.await;
-                }
+                let task = state.update(cx, |state, cx| state.authenticate_and_refresh(true, cx));
+                let authentication_error = match task.await {
+                    Ok(()) | Err(AuthenticateError::CredentialsNotFound) => None,
+                    Err(error) => {
+                        log::warn!("Failed to authenticate Amazon Bedrock: {error}");
+                        Some(SharedString::from(error.to_string()))
+                    }
+                };
                 this.update(cx, |this, cx| {
                     this.load_credentials_task = None;
+                    this.authentication_error = authentication_error;
                     cx.notify();
                 })
                 .log_err();
             }
+        }));
+
+        let profiles = cx.background_spawn(load_aws_profiles());
+        let load_profiles_task = Some(cx.spawn(async move |this, cx| {
+            let (aws_profiles, profile_error) = match profiles.await {
+                Ok(profiles) => (profiles, None),
+                Err(error) => {
+                    log::warn!("Failed to load AWS profiles: {error:#}");
+                    (Vec::new(), Some(SharedString::from(format!("{error:#}"))))
+                }
+            };
+            this.update(cx, |this, cx| {
+                this.aws_profiles = aws_profiles;
+                this.profile_error = profile_error;
+                this.load_profiles_task = None;
+                cx.notify();
+            })
+            .log_err();
         }));
 
         Self {
@@ -3337,8 +3561,372 @@ impl ConfigurationView {
             bearer_token_editor,
             state,
             load_credentials_task,
+            aws_profiles: Vec::new(),
+            load_profiles_task,
+            authentication_error: None,
+            profile_error: None,
             focus_handle,
         }
+    }
+
+    fn persist_authentication(
+        selection: BedrockAuthSelection,
+        profile_name: Option<String>,
+        cx: &mut App,
+    ) {
+        let fs = <dyn Fs>::global(cx);
+        update_settings_file(fs, cx, move |settings, _| {
+            let bedrock = settings
+                .language_models
+                .get_or_insert_default()
+                .bedrock
+                .get_or_insert_default();
+            bedrock.authentication_method = Some(selection.settings_value());
+            if let Some(profile_name) = profile_name {
+                bedrock.profile = Some(profile_name);
+            }
+        });
+    }
+
+    fn persist_region(region: String, cx: &mut App) {
+        let fs = <dyn Fs>::global(cx);
+        update_settings_file(fs, cx, move |settings, _| {
+            settings
+                .language_models
+                .get_or_insert_default()
+                .bedrock
+                .get_or_insert_default()
+                .region = Some(region);
+        });
+    }
+
+    fn reload_profiles(&mut self, cx: &mut Context<Self>) {
+        self.profile_error = None;
+        let profiles = cx.background_spawn(load_aws_profiles());
+        self.load_profiles_task = Some(cx.spawn(async move |this, cx| {
+            let (aws_profiles, profile_error) = match profiles.await {
+                Ok(profiles) => (profiles, None),
+                Err(error) => {
+                    log::warn!("Failed to load AWS profiles: {error:#}");
+                    (Vec::new(), Some(SharedString::from(format!("{error:#}"))))
+                }
+            };
+            this.update(cx, |this, cx| {
+                this.aws_profiles = aws_profiles;
+                this.profile_error = profile_error;
+                this.load_profiles_task = None;
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn retry_discovery(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| state.refresh_targets(cx));
+    }
+
+    fn render_configuration_controls(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (selection, profile_name, region) = {
+            let state = self.state.read(cx);
+            let selection = BedrockAuthSelection::from_state(state);
+            let profile_name = state
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.profile_name.clone())
+                .or_else(|| match state.auth.as_ref() {
+                    Some(BedrockAuth::NamedProfile { profile_name })
+                    | Some(BedrockAuth::SingleSignOn { profile_name }) => {
+                        Some(profile_name.clone())
+                    }
+                    _ => None,
+                });
+            (selection, profile_name, state.get_region())
+        };
+
+        let profiles = self.aws_profiles.clone();
+        let auth_profile_name = profile_name.clone();
+        let auth_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for candidate in BedrockAuthSelection::ALL {
+                let profile_name = candidate.profile_kind().map(|kind| {
+                    if candidate == selection {
+                        auth_profile_name
+                            .clone()
+                            .unwrap_or_else(|| "default".to_string())
+                    } else {
+                        profiles
+                            .iter()
+                            .find(|profile| profile.kind == kind)
+                            .map(|profile| profile.name.clone())
+                            .unwrap_or_else(|| "default".to_string())
+                    }
+                });
+                menu.push_item(
+                    ContextMenuEntry::new(candidate.label())
+                        .toggleable(IconPosition::End, candidate == selection)
+                        .handler(move |_, cx| {
+                            Self::persist_authentication(candidate, profile_name.clone(), cx);
+                        }),
+                );
+            }
+            menu
+        });
+
+        let auth_dropdown = DropdownMenu::new(
+            "bedrock-authentication-method",
+            selection.label(),
+            auth_menu,
+        )
+        .style(DropdownStyle::Outlined)
+        .full_width(true)
+        .tab_index(0)
+        .aria_label("Amazon Bedrock authentication method")
+        .aria_description(
+            "Choose the AWS credential chain, a local AWS profile, an SSO profile, or static credentials.",
+        )
+        .aria_value(selection.label());
+
+        let profile_control = selection.profile_kind().map(|kind| {
+            let matching_profiles = self
+                .aws_profiles
+                .iter()
+                .filter(|profile| profile.kind == kind)
+                .cloned()
+                .collect::<Vec<_>>();
+            let current_profile = profile_name
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let has_profiles = !matching_profiles.is_empty();
+            let profile_menu = ContextMenu::build(window, cx, {
+                let current_profile = current_profile.clone();
+                move |mut menu, _, _| {
+                    if matching_profiles.is_empty() {
+                        menu.push_item(
+                            ContextMenuEntry::new("No local profiles found").disabled(true),
+                        );
+                    } else {
+                        for profile in matching_profiles.iter() {
+                            let profile_name = profile.name.clone();
+                            menu.push_item(
+                                ContextMenuEntry::new(profile.name.clone())
+                                    .toggleable(IconPosition::End, profile.name == current_profile)
+                                    .handler(move |_, cx| {
+                                        Self::persist_authentication(
+                                            selection,
+                                            Some(profile_name.clone()),
+                                            cx,
+                                        );
+                                    }),
+                            );
+                        }
+                    }
+                    menu
+                }
+            });
+            let loading = self.load_profiles_task.is_some();
+            let disabled = loading || !has_profiles;
+            let disabled_reason = if loading {
+                "Local AWS profiles are still loading."
+            } else if kind == AwsProfileKind::SingleSignOn {
+                "No AWS SSO profiles were found in your AWS config files."
+            } else {
+                "No AWS credential profiles were found in your AWS config files."
+            };
+            v_flex()
+                .gap_1()
+                .child(Label::new("AWS profile").size(LabelSize::Small))
+                .child(
+                    DropdownMenu::new(
+                        "bedrock-profile",
+                        if loading {
+                            "Loading AWS profiles…".to_string()
+                        } else {
+                            current_profile.clone()
+                        },
+                        profile_menu,
+                    )
+                    .style(DropdownStyle::Outlined)
+                    .full_width(true)
+                    .tab_index(1)
+                    .disabled(disabled)
+                    .aria_label("AWS profile")
+                    .aria_description(if disabled {
+                        disabled_reason
+                    } else {
+                        "Choose a profile loaded from your local AWS config and credentials files."
+                    })
+                    .aria_value(current_profile),
+                )
+                .when(!loading && !has_profiles, |this| {
+                    this.child(
+                        Button::new("reload-empty-bedrock-profiles", "Reload AWS profiles")
+                            .style(ButtonStyle::Outlined)
+                            .on_click(cx.listener(|this, _, _, cx| this.reload_profiles(cx))),
+                    )
+                })
+                .into_any_element()
+        });
+
+        let region_from_environment = ZED_BEDROCK_REGION_VAR
+            .value
+            .as_deref()
+            .is_some_and(|region| !region.is_empty());
+        let region_menu = ContextMenu::build(window, cx, {
+            let current_region = region.clone();
+            move |mut menu, _, _| {
+                if !BEDROCK_REGIONS
+                    .iter()
+                    .any(|(region, _)| *region == current_region)
+                {
+                    let region = current_region.clone();
+                    menu.push_item(
+                        ContextMenuEntry::new(region.clone())
+                            .toggleable(IconPosition::End, true)
+                            .handler(move |_, cx| Self::persist_region(region.clone(), cx)),
+                    );
+                }
+                for (region, name) in BEDROCK_REGIONS {
+                    let label = format!("{name} — {region}");
+                    let selected = *region == current_region;
+                    let region = (*region).to_string();
+                    menu.push_item(
+                        ContextMenuEntry::new(label)
+                            .toggleable(IconPosition::End, selected)
+                            .handler(move |_, cx| Self::persist_region(region.clone(), cx)),
+                    );
+                }
+                menu
+            }
+        });
+        let region_description = if region_from_environment {
+            format!(
+                "Region is controlled by the {} environment variable. Unset it and restart Zed to change regions here.",
+                ZED_BEDROCK_REGION_VAR.name
+            )
+        } else {
+            "Choose the AWS Region used for Bedrock Runtime and Mantle model discovery.".to_string()
+        };
+
+        v_flex()
+            .gap_2()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(Label::new("Authentication").size(LabelSize::Small))
+                    .child(auth_dropdown),
+            )
+            .when_some(profile_control, |this, control| this.child(control))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(Label::new("AWS Region").size(LabelSize::Small))
+                    .child(
+                        DropdownMenu::new("bedrock-region", region.clone(), region_menu)
+                            .style(DropdownStyle::Outlined)
+                            .full_width(true)
+                            .tab_index(2)
+                            .disabled(region_from_environment)
+                            .aria_label("Amazon Bedrock AWS Region")
+                            .aria_description(region_description)
+                            .aria_value(region),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_catalog_status(&self, cx: &mut Context<Self>) -> AnyElement {
+        let state = self.state.read(cx);
+        if !state.is_authenticated() {
+            return v_flex()
+                .gap_1()
+                .child(Label::new("Model catalogs").size(LabelSize::Small))
+                .child(
+                    Label::new("Authenticate to discover the models available to this AWS account and Region.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any_element();
+        }
+        let runtime_status = if state.discovery_in_progress {
+            "Discovering Bedrock Runtime models…".to_string()
+        } else if let Some(error) = state.runtime_discovery_error.as_ref() {
+            format!(
+                "Bedrock Runtime discovery failed: {error}. Built-in and configured models remain available."
+            )
+        } else {
+            format!(
+                "Bedrock Runtime: {} model targets discovered",
+                state.runtime_targets.len()
+            )
+        };
+        let mantle_status = if state.mantle_endpoint_available == Some(false) {
+            format!(
+                "Bedrock Mantle is not available in {}. Runtime models remain available.",
+                state.get_region()
+            )
+        } else if state.discovery_in_progress {
+            "Discovering Bedrock Mantle models…".to_string()
+        } else if let Some(error) = state.mantle_discovery_error.as_ref() {
+            format!(
+                "Bedrock Mantle discovery failed: {error}. Built-in and configured Mantle models remain available."
+            )
+        } else {
+            format!(
+                "Bedrock Mantle: {} model targets discovered",
+                state.mantle_targets.len()
+            )
+        };
+        let has_error =
+            state.runtime_discovery_error.is_some() || state.mantle_discovery_error.is_some();
+        let can_retry = state.is_authenticated() && !state.discovery_in_progress;
+        let endpoint_status = state
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.endpoint.as_ref())
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(|endpoint| {
+                format!(
+                    "Custom Bedrock Runtime endpoint: {endpoint}. Mantle continues to use its regional AWS endpoint."
+                )
+            });
+
+        v_flex()
+            .gap_1()
+            .child(Label::new("Model catalogs").size(LabelSize::Small))
+            .when_some(endpoint_status, |this, status| {
+                this.child(
+                    Label::new(status)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .child(Label::new(runtime_status).size(LabelSize::Small).color(
+                if state.runtime_discovery_error.is_some() {
+                    Color::Error
+                } else {
+                    Color::Muted
+                },
+            ))
+            .child(Label::new(mantle_status).size(LabelSize::Small).color(
+                if state.mantle_discovery_error.is_some() {
+                    Color::Error
+                } else {
+                    Color::Muted
+                },
+            ))
+            .when(has_error, |this| {
+                this.child(
+                    Button::new("retry-bedrock-discovery", "Retry model discovery")
+                        .style(ButtonStyle::Outlined)
+                        .disabled(!can_retry)
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_discovery(cx))),
+                )
+            })
+            .into_any_element()
     }
 
     fn save_credentials(
@@ -3430,18 +4018,16 @@ impl ConfigurationView {
 }
 
 impl Render for ConfigurationView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let state = self.state.read(cx);
-        let env_var_set = state.credentials_from_env;
-        let auth = state.auth.clone();
-        let settings_auth_method = state
-            .settings
-            .as_ref()
-            .and_then(|s| s.authentication_method.clone());
-
-        if self.load_credentials_task.is_some() {
-            return div().child(Label::new("Loading credentials...")).into_any();
-        }
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (env_var_set, auth, selection, is_authenticated) = {
+            let state = self.state.read(cx);
+            (
+                state.credentials_from_env,
+                state.auth.clone(),
+                BedrockAuthSelection::from_state(state),
+                state.is_authenticated(),
+            )
+        };
 
         let configured_label = match &auth {
             Some(BedrockAuth::Automatic) => {
@@ -3470,15 +4056,6 @@ impl Render for ConfigurationView {
             None => "Not authenticated".into(),
         };
 
-        // Determine if credentials can be reset
-        // Settings-derived auth (non-ApiKey) cannot be reset from UI
-        let is_settings_derived = matches!(
-            settings_auth_method,
-            Some(BedrockAuthMethod::Automatic)
-                | Some(BedrockAuthMethod::NamedProfile)
-                | Some(BedrockAuthMethod::SingleSignOn)
-        );
-
         let tooltip_label = if env_var_set {
             Some(format!(
                 "To reset your credentials, unset the {}, {}, and {} or {} environment variables.",
@@ -3487,24 +4064,33 @@ impl Render for ConfigurationView {
                 ZED_BEDROCK_SESSION_TOKEN_VAR.name,
                 ZED_BEDROCK_BEARER_TOKEN_VAR.name
             ))
-        } else if is_settings_derived {
-            Some(
-                "Authentication method is configured in settings. Edit settings.json to change."
-                    .to_string(),
-            )
         } else {
             None
         };
 
-        let credentials_control = if self.state.read(cx).is_authenticated() {
-            ConfiguredApiCard::new("bedrock-reset", configured_label)
-                .disabled(env_var_set || is_settings_derived)
-                .on_click(cx.listener(|this, _, window, cx| this.reset_credentials(window, cx)))
-                .when_some(tooltip_label, |this, label| this.tooltip_label(label))
-                .into_any_element()
-        } else {
-            self.render_static_credentials_ui().into_any_element()
-        };
+        let credentials_control =
+            if selection == BedrockAuthSelection::StaticCredentials && is_authenticated {
+                ConfiguredApiCard::new("bedrock-reset", configured_label)
+                    .disabled(env_var_set)
+                    .on_click(cx.listener(|this, _, window, cx| this.reset_credentials(window, cx)))
+                    .when_some(tooltip_label, |this, label| this.tooltip_label(label))
+                    .into_any_element()
+            } else if selection == BedrockAuthSelection::StaticCredentials {
+                self.render_static_credentials_ui().into_any_element()
+            } else {
+                ConfiguredApiCard::new("bedrock-auth-status", configured_label)
+                    .disabled(true)
+                    .tooltip_label(
+                        "Change the authentication method above to use different credentials.",
+                    )
+                    .into_any_element()
+            };
+
+        let configuration_controls = self.render_configuration_controls(window, cx);
+        let catalog_status = self.render_catalog_status(cx);
+        let loading_credentials = self.load_credentials_task.is_some();
+        let authentication_error = self.authentication_error.clone();
+        let profile_error = self.profile_error.clone();
 
         v_flex()
             .min_w_0()
@@ -3517,7 +4103,7 @@ impl Render for ConfigurationView {
             .child(Headline::new("Amazon Bedrock").size(HeadlineSize::Small))
             .child(
                 Label::new(
-                    "To use Zed's agent with Bedrock, you can set a custom authentication strategy through your settings file or use static credentials.",
+                    "Choose an AWS authentication method and Region. Zed discovers Bedrock Runtime and Mantle models for the selected account without requiring model IDs or ARNs.",
                 )
                 .color(Color::Muted),
             )
@@ -3553,6 +4139,40 @@ impl Render for ConfigurationView {
                             )),
                     ),
             )
+            .child(Divider::horizontal().my_1())
+            .child(configuration_controls)
+            .when(loading_credentials, |this| {
+                this.child(
+                    Label::new("Loading credentials…")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+            })
+            .when_some(authentication_error, |this, error| {
+                this.child(
+                    Label::new(format!("Authentication failed: {error}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                )
+            })
+            .when_some(profile_error, |this, error| {
+                this.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Label::new(format!("Could not load local AWS profiles: {error}"))
+                                .size(LabelSize::Small)
+                                .color(Color::Error),
+                        )
+                        .child(
+                            Button::new("reload-bedrock-profiles", "Reload AWS profiles")
+                                .style(ButtonStyle::Outlined)
+                                .on_click(cx.listener(|this, _, _, cx| this.reload_profiles(cx))),
+                        ),
+                )
+            })
+            .child(Divider::horizontal().my_1())
+            .child(catalog_status)
             .child(credentials_control)
             .into_any()
     }
@@ -3636,7 +4256,7 @@ impl ConfigurationView {
             )
             .child(
                 Label::new(format!(
-                    "Optionally, if your environment uses AWS CLI profiles, you can set {}; if it requires a custom endpoint, you can set {}; and if it requires a Session Token, you can set {}.",
+                    "The profile selector above also supports {}; custom endpoints can use {}; and temporary IAM credentials can use {}.",
                     ZED_AWS_PROFILE_VAR.name,
                     ZED_AWS_ENDPOINT_VAR.name,
                     ZED_BEDROCK_SESSION_TOKEN_VAR.name
@@ -3651,7 +4271,7 @@ impl ConfigurationView {
             .child(self.bearer_token_editor.clone())
             .child(
                 Label::new(format!(
-                    "Region is configured via {} environment variable or settings.json (defaults to us-east-1).",
+                    "The Region selected above can be overridden with {}.",
                     ZED_BEDROCK_REGION_VAR.name
                 ))
                 .size(LabelSize::Small)
@@ -3727,6 +4347,38 @@ mod tests {
                     kind: AwsProfileKind::Credentials,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_bedrock_auth_selection_uses_settings_schema_values() {
+        assert_eq!(
+            serde_json::to_value(BedrockAuthSelection::Automatic.settings_value())
+                .expect("serialize automatic authentication"),
+            serde_json::json!("default")
+        );
+        assert_eq!(
+            serde_json::to_value(BedrockAuthSelection::NamedProfile.settings_value())
+                .expect("serialize named-profile authentication"),
+            serde_json::json!("named_profile")
+        );
+        assert_eq!(
+            serde_json::to_value(BedrockAuthSelection::SingleSignOn.settings_value())
+                .expect("serialize SSO authentication"),
+            serde_json::json!("sso")
+        );
+        assert_eq!(
+            serde_json::to_value(BedrockAuthSelection::StaticCredentials.settings_value())
+                .expect("serialize static authentication"),
+            serde_json::json!("api_key")
+        );
+        assert_eq!(
+            BedrockAuthSelection::NamedProfile.profile_kind(),
+            Some(AwsProfileKind::Credentials)
+        );
+        assert_eq!(
+            BedrockAuthSelection::SingleSignOn.profile_kind(),
+            Some(AwsProfileKind::SingleSignOn)
         );
     }
 
@@ -4283,6 +4935,15 @@ mod tests {
         assert!(MANTLE_SUPPORTED_REGIONS.contains(&"us-east-1"));
         assert!(MANTLE_SUPPORTED_REGIONS.contains(&"eu-west-1"));
         assert!(!MANTLE_SUPPORTED_REGIONS.contains(&"ap-southeast-1"));
+
+        let regions = BEDROCK_REGIONS
+            .iter()
+            .map(|(region, _)| *region)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(regions.len(), BEDROCK_REGIONS.len());
+        for mantle_region in MANTLE_SUPPORTED_REGIONS {
+            assert!(regions.contains(mantle_region));
+        }
     }
 
     fn mantle_message_item(id: &str) -> ResponseOutputItem {
