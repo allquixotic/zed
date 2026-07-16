@@ -153,11 +153,11 @@ pub struct BedrockMantleAvailableModel {
     pub display_name: Option<String>,
     pub max_tokens: u64,
     pub max_output_tokens: Option<u64>,
-    /// The OpenAI-compatible API this model must be called through.
+    /// The Mantle API this model must be called through.
     pub protocol: BedrockMantleProtocolContent,
     pub supports_tools: Option<bool>,
     pub supports_images: Option<bool>,
-    /// Whether this custom Mantle model supports OpenAI reasoning effort parameters.
+    /// Whether this custom Mantle model supports reasoning effort parameters.
     pub supports_thinking: Option<bool>,
 }
 
@@ -169,6 +169,9 @@ pub enum BedrockMantleProtocolContent {
     /// The OpenAI Responses API (`/responses`).
     #[serde(rename = "responses")]
     Responses,
+    /// The Anthropic Messages API (`/anthropic/v1/messages`).
+    #[serde(rename = "anthropic_messages")]
+    AnthropicMessages,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]

@@ -67,6 +67,7 @@ use ui_input::InputField;
 use util::ResultExt;
 
 use crate::AllLanguageModelSettings;
+use crate::provider::anthropic::{AnthropicEventMapper, AnthropicPromptCacheMode, into_anthropic};
 use crate::provider::open_ai::{
     ChatCompletionMaxTokensParameter, OpenAiEventMapper, OpenAiResponseEventMapper, into_open_ai,
     into_open_ai_response,
@@ -85,6 +86,7 @@ pub(crate) const RESERVED_HEADER_NAMES: &[&str] = &[
     "x-amz-content-sha256",
     "amz-sdk-invocation-id",
     "amz-sdk-request",
+    "anthropic-version",
 ];
 
 /// Credentials stored in the keychain for static authentication.
@@ -614,6 +616,9 @@ fn mantle_protocol_from_settings(value: settings::BedrockMantleProtocolContent) 
     match value {
         settings::BedrockMantleProtocolContent::ChatCompletions => MantleProtocol::ChatCompletions,
         settings::BedrockMantleProtocolContent::Responses => MantleProtocol::Responses,
+        settings::BedrockMantleProtocolContent::AnthropicMessages => {
+            MantleProtocol::AnthropicMessages
+        }
     }
 }
 
@@ -685,9 +690,11 @@ const MANTLE_SUPPORTED_REGIONS: &[&str] = &[
     "us-gov-west-1",
 ];
 
-fn mantle_endpoint_url(region: &str) -> String {
-    format!("https://bedrock-mantle.{region}.api.aws/openai/v1")
+fn mantle_endpoint_url(region: &str, path: &str) -> String {
+    format!("https://bedrock-mantle.{region}.api.aws/{path}")
 }
+
+const ANTHROPIC_MANTLE_HEADERS: &[(&str, &str)] = &[("anthropic-version", "2023-06-01")];
 
 enum MantleAuth {
     ApiKey { api_key: String },
@@ -1563,6 +1570,32 @@ fn mantle_supported_effort_levels(model: &MantleModel) -> Vec<LanguageModelEffor
         .collect()
 }
 
+fn into_mantle_anthropic(
+    request: LanguageModelRequest,
+    model: &MantleModel,
+) -> Result<anthropic::Request> {
+    let mode = if model.supports_thinking() {
+        anthropic::AnthropicModelMode::AdaptiveThinking
+    } else {
+        anthropic::AnthropicModelMode::Default
+    };
+    let mut request = into_anthropic(
+        request,
+        model.request_id().to_string(),
+        1.0,
+        model.max_output_tokens(),
+        mode,
+        AnthropicPromptCacheMode::Automatic,
+    )?;
+    if matches!(
+        model,
+        MantleModel::ClaudeOpus4_7 | MantleModel::ClaudeOpus4_8
+    ) {
+        request.temperature = None;
+    }
+    Ok(request)
+}
+
 /// Special-cases Mantle authorization failures with a message that points at
 /// the separate `bedrock-mantle` IAM policy namespace instead of regular
 /// `bedrock-runtime` permissions.
@@ -1600,26 +1633,44 @@ fn parse_mantle_chat_stream_line(line: &str) -> Result<ResponseStreamEvent> {
     match serde_json::from_str(line) {
         Ok(MantleChatStreamResult::Ok(response)) => Ok(response),
         Ok(MantleChatStreamResult::Err { error }) => Err(anyhow!(error.message)),
-        Err(error) => {
-            log::error!(
-                "Failed to parse Mantle chat completion stream event: `{}`\nResponse: `{}`",
-                error,
-                line,
-            );
-            Err(anyhow!(error))
-        }
+        Err(error) => Err(anyhow!(
+            "failed to parse Mantle chat completion event: {error}"
+        )),
     }
 }
 
 fn parse_mantle_response_stream_line(line: &str) -> Result<open_ai::responses::StreamEvent> {
-    serde_json::from_str(line).map_err(|error| {
-        log::error!(
-            "Failed to parse Mantle responses stream event: `{}`\nResponse: `{}`",
-            error,
-            line,
+    serde_json::from_str(line)
+        .map_err(|error| anyhow!("failed to parse Mantle responses event: {error}"))
+}
+
+fn parse_mantle_anthropic_stream_line(line: &str) -> Result<anthropic::Event> {
+    serde_json::from_str(line)
+        .map_err(|error| anyhow!("failed to parse Mantle Anthropic event: {error}"))
+}
+
+fn build_mantle_http_request(
+    url: &str,
+    body: &[u8],
+    region: &str,
+    auth: &MantleAuth,
+    extra_headers: &CustomHeaders,
+    required_headers: &'static [(&'static str, &'static str)],
+) -> Result<HttpRequest<AsyncBody>> {
+    let mut request = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(url)
+        .header("Content-Type", "application/json")
+        .extra_headers(extra_headers)
+        .body(AsyncBody::from(body.to_vec()))?;
+    for (name, value) in required_headers {
+        request.headers_mut().insert(
+            http_client::http::header::HeaderName::from_static(name),
+            HeaderValue::from_static(value),
         );
-        anyhow!(error)
-    })
+    }
+    auth.apply(&mut request, body, region)?;
+    Ok(request)
 }
 
 async fn stream_mantle_sse<Request, Event>(
@@ -1630,6 +1681,7 @@ async fn stream_mantle_sse<Request, Event>(
     auth: &MantleAuth,
     request: Request,
     extra_headers: &CustomHeaders,
+    required_headers: &'static [(&'static str, &'static str)],
     parse_stream_line: fn(&str) -> Result<Event>,
 ) -> std::result::Result<BoxStream<'static, Result<Event>>, RequestError>
 where
@@ -1637,16 +1689,9 @@ where
     Event: Send + 'static,
 {
     let body = serde_json::to_vec(&request).map_err(|error| RequestError::Other(error.into()))?;
-    let mut request = HttpRequest::builder()
-        .method(Method::POST)
-        .uri(url)
-        .header("Content-Type", "application/json")
-        .extra_headers(extra_headers)
-        .body(AsyncBody::from(body.clone()))
-        .map_err(|error| RequestError::Other(error.into()))?;
-
-    auth.apply(&mut request, &body, region)
-        .map_err(RequestError::Other)?;
+    let request =
+        build_mantle_http_request(url, &body, region, auth, extra_headers, required_headers)
+            .map_err(RequestError::Other)?;
 
     let mut response = client.send(request).await?;
     if response.status().is_success() {
@@ -2136,6 +2181,7 @@ impl BedrockMantleModel {
         request: Request,
         cx: &AsyncApp,
         endpoint: &'static str,
+        required_headers: &'static [(&'static str, &'static str)],
         parse_stream_line: fn(&str) -> Result<Event>,
     ) -> BoxFuture<'static, Result<BoxStream<'static, Result<Event>>, LanguageModelCompletionError>>
     where
@@ -2152,7 +2198,7 @@ impl BedrockMantleModel {
                 state.get_region(),
             )
         });
-        let url = format!("{}/{}", mantle_endpoint_url(&region), endpoint);
+        let url = mantle_endpoint_url(&region, endpoint);
         let extra_headers = cx.read_entity(&self.state, |_, cx| {
             AllLanguageModelSettings::get_global(cx)
                 .bedrock
@@ -2181,6 +2227,7 @@ impl BedrockMantleModel {
                 &auth,
                 request,
                 &extra_headers,
+                required_headers,
                 parse_stream_line,
             )
             .await
@@ -2201,7 +2248,8 @@ impl BedrockMantleModel {
         self.stream_mantle_request(
             request,
             cx,
-            "chat/completions",
+            "openai/v1/chat/completions",
+            &[],
             parse_mantle_chat_stream_line,
         )
     }
@@ -2219,7 +2267,33 @@ impl BedrockMantleModel {
     > {
         let mut request = request;
         strip_unsupported_mantle_response_fields(&mut request);
-        self.stream_mantle_request(request, cx, "responses", parse_mantle_response_stream_line)
+        self.stream_mantle_request(
+            request,
+            cx,
+            "openai/v1/responses",
+            &[],
+            parse_mantle_response_stream_line,
+        )
+    }
+
+    fn stream_anthropic(
+        &self,
+        request: anthropic::Request,
+        cx: &AsyncApp,
+    ) -> BoxFuture<
+        'static,
+        Result<BoxStream<'static, Result<anthropic::Event>>, LanguageModelCompletionError>,
+    > {
+        self.stream_mantle_request(
+            anthropic::StreamingRequest {
+                base: request,
+                stream: true,
+            },
+            cx,
+            "anthropic/v1/messages",
+            ANTHROPIC_MANTLE_HEADERS,
+            parse_mantle_anthropic_stream_line,
+        )
     }
 }
 
@@ -2269,6 +2343,10 @@ impl LanguageModel for BedrockMantleModel {
         self.model.supports_thinking()
     }
 
+    fn refusal_fallback_model_id(&self) -> Option<&'static str> {
+        matches!(self.model, MantleModel::ClaudeFable5).then_some("bedrock-mantle/claude-opus-4-8")
+    }
+
     fn supported_effort_levels(&self) -> Vec<LanguageModelEffortLevel> {
         mantle_supported_effort_levels(&self.model)
     }
@@ -2316,6 +2394,22 @@ impl LanguageModel for BedrockMantleModel {
         let max_output_tokens = Some(self.model.max_output_tokens());
 
         match self.model.protocol() {
+            MantleProtocol::AnthropicMessages => {
+                let request = match into_mantle_anthropic(request, &self.model) {
+                    Ok(request) => request,
+                    Err(error) => return async move { Err(error.into()) }.boxed(),
+                };
+                let completions = self.stream_anthropic(request, cx);
+                async move {
+                    let events = completions
+                        .await?
+                        .map(|event| event.map_err(anthropic::AnthropicError::HttpSend));
+                    Ok(AnthropicEventMapper::new(PROVIDER_NAME)
+                        .map_stream(events.boxed())
+                        .boxed())
+                }
+                .boxed()
+            }
             MantleProtocol::Responses => {
                 let request = into_open_ai_response(
                     request,
@@ -3675,15 +3769,53 @@ mod tests {
     }
 
     #[test]
-    fn test_mantle_endpoint_url_uses_openai_path_prefix() {
+    fn test_mantle_endpoint_url_preserves_protocol_path() {
         assert_eq!(
-            mantle_endpoint_url("us-east-1"),
-            "https://bedrock-mantle.us-east-1.api.aws/openai/v1"
+            mantle_endpoint_url("us-east-1", "openai/v1/responses"),
+            "https://bedrock-mantle.us-east-1.api.aws/openai/v1/responses"
         );
         assert_eq!(
-            mantle_endpoint_url("us-west-2"),
-            "https://bedrock-mantle.us-west-2.api.aws/openai/v1"
+            mantle_endpoint_url("us-west-2", "anthropic/v1/messages"),
+            "https://bedrock-mantle.us-west-2.api.aws/anthropic/v1/messages"
         );
+    }
+
+    #[test]
+    fn test_mantle_anthropic_version_header_is_signed() {
+        let credentials = Credentials::new(
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            None,
+            None,
+            "test",
+        );
+        let body = br#"{"model":"anthropic.claude-mythos-5","stream":true}"#;
+        let url = mantle_endpoint_url("us-east-1", "anthropic/v1/messages");
+        let request = build_mantle_http_request(
+            &url,
+            body,
+            "us-east-1",
+            &MantleAuth::SigV4 { credentials },
+            &CustomHeaders::default(),
+            ANTHROPIC_MANTLE_HEADERS,
+        )
+        .unwrap();
+
+        assert_eq!(request.uri().to_string(), url);
+        assert_eq!(
+            request
+                .headers()
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2023-06-01")
+        );
+        let authorization = request
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(authorization.contains("anthropic-version"));
+        assert!(authorization.contains("/us-east-1/bedrock-mantle/aws4_request"));
     }
 
     #[test]
@@ -3696,6 +3828,78 @@ mod tests {
             mantle_protocol_from_settings(settings::BedrockMantleProtocolContent::Responses),
             MantleProtocol::Responses
         );
+        assert_eq!(
+            mantle_protocol_from_settings(
+                settings::BedrockMantleProtocolContent::AnthropicMessages
+            ),
+            MantleProtocol::AnthropicMessages
+        );
+    }
+
+    #[test]
+    fn test_mantle_anthropic_request_uses_adaptive_thinking_and_cache() {
+        let request = into_mantle_anthropic(
+            LanguageModelRequest {
+                messages: vec![LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("Plan the change".to_string())],
+                    cache: true,
+                    reasoning_details: None,
+                }],
+                thinking_allowed: true,
+                thinking_effort: Some("xhigh".to_string()),
+                ..Default::default()
+            },
+            &MantleModel::ClaudeMythos5,
+        )
+        .unwrap();
+
+        assert_eq!(request.model, "anthropic.claude-mythos-5");
+        assert!(matches!(
+            request.thinking,
+            Some(anthropic::Thinking::Adaptive { .. })
+        ));
+        assert_eq!(
+            request.output_config.and_then(|config| config.effort),
+            Some(anthropic::Effort::XHigh)
+        );
+        assert!(request.cache_control.is_some());
+    }
+
+    #[test]
+    fn test_mantle_opus_request_omits_unsupported_temperature() {
+        let request = into_mantle_anthropic(
+            LanguageModelRequest {
+                messages: vec![LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![MessageContent::Text("Plan the change".to_string())],
+                    cache: false,
+                    reasoning_details: None,
+                }],
+                temperature: Some(0.5),
+                ..Default::default()
+            },
+            &MantleModel::ClaudeOpus4_7,
+        )
+        .unwrap();
+
+        assert_eq!(request.temperature, None);
+    }
+
+    #[test]
+    fn test_mantle_anthropic_stream_parser_preserves_signatures() {
+        let event = parse_mantle_anthropic_stream_line(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"signed"}}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            event,
+            anthropic::Event::ContentBlockDelta {
+                delta: anthropic::ContentDelta::SignatureDelta { signature },
+                ..
+            } if signature == "signed"
+        ));
     }
 
     #[test]
