@@ -786,10 +786,6 @@ impl DirectWriteState {
         params: &RenderGlyphParams,
         glyph_bounds: Bounds<DevicePixels>,
     ) -> Result<Vec<u8>> {
-        // INVARIANT: the code below drives the *shared* D3D11 immediate context
-        // (`Map`/`Unmap`/`Draw`/`CopyResource`), which `DirectXRenderer` and `DirectXAtlas` also
-        // touch. An immediate `ID3D11DeviceContext` is not thread-safe, so this must only run on
-        // the main UI thread (which it always is; text rasterization never leaves that thread).
         let bitmap_size = glyph_bounds.size;
         let subpixel_shift = params
             .subpixel_variant
