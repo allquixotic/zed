@@ -176,10 +176,8 @@ pub enum BedrockMantleProtocolContent {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub enum BedrockAuthMethodContent {
-    #[serde(rename = "named_profile")]
+    #[serde(rename = "named_profile", alias = "sso")]
     NamedProfile,
-    #[serde(rename = "sso")]
-    SingleSignOn,
     #[serde(rename = "api_key")]
     ApiKey,
     /// IMDSv2, PodIdentity, env vars, etc.

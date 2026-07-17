@@ -112,8 +112,6 @@ pub enum BedrockAuth {
     Automatic,
     /// Use AWS named profile from ~/.aws/credentials or ~/.aws/config
     NamedProfile { profile_name: String },
-    /// Use AWS SSO profile
-    SingleSignOn { profile_name: String },
     /// Use IAM credentials (access key + secret + optional session token)
     IamCredentials {
         access_key_id: String,
@@ -159,10 +157,8 @@ pub struct AmazonBedrockSettings {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, EnumIter, IntoStaticStr, JsonSchema)]
 pub enum BedrockAuthMethod {
-    #[serde(rename = "named_profile")]
+    #[serde(rename = "named_profile", alias = "sso")]
     NamedProfile,
-    #[serde(rename = "sso")]
-    SingleSignOn,
     #[serde(rename = "api_key")]
     ApiKey,
     /// IMDSv2, PodIdentity, env vars, etc.
@@ -173,7 +169,6 @@ pub enum BedrockAuthMethod {
 impl From<settings::BedrockAuthMethodContent> for BedrockAuthMethod {
     fn from(value: settings::BedrockAuthMethodContent) -> Self {
         match value {
-            settings::BedrockAuthMethodContent::SingleSignOn => BedrockAuthMethod::SingleSignOn,
             settings::BedrockAuthMethodContent::Automatic => BedrockAuthMethod::Automatic,
             settings::BedrockAuthMethodContent::NamedProfile => BedrockAuthMethod::NamedProfile,
             settings::BedrockAuthMethodContent::ApiKey => BedrockAuthMethod::ApiKey,
@@ -181,16 +176,9 @@ impl From<settings::BedrockAuthMethodContent> for BedrockAuthMethod {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AwsProfileKind {
-    Credentials,
-    SingleSignOn,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AwsProfile {
     pub name: String,
-    pub kind: AwsProfileKind,
 }
 
 pub async fn load_aws_profiles() -> Result<Vec<AwsProfile>> {
@@ -220,20 +208,8 @@ async fn load_aws_profiles_from(
 fn aws_profiles_from_set(profile_set: &aws_config::profile::ProfileSet) -> Vec<AwsProfile> {
     let mut profiles = profile_set
         .profiles()
-        .filter_map(|name| {
-            let profile = profile_set.get_profile(name)?;
-            let kind = if profile.get("sso_session").is_some()
-                || profile.get("sso_start_url").is_some()
-                || profile.get("sso_account_id").is_some()
-            {
-                AwsProfileKind::SingleSignOn
-            } else {
-                AwsProfileKind::Credentials
-            };
-            Some(AwsProfile {
-                name: name.to_string(),
-                kind,
-            })
+        .map(|name| AwsProfile {
+            name: name.to_string(),
         })
         .collect::<Vec<_>>();
     profiles.sort_by(|left, right| {
@@ -316,8 +292,7 @@ async fn build_aws_session(
 
     match configuration.auth {
         Some(BedrockAuth::Automatic) | None => {}
-        Some(BedrockAuth::NamedProfile { profile_name })
-        | Some(BedrockAuth::SingleSignOn { profile_name }) => {
+        Some(BedrockAuth::NamedProfile { profile_name }) => {
             if !profile_name.is_empty() {
                 config_builder = config_builder.profile_name(profile_name);
             }
@@ -1183,7 +1158,6 @@ impl State {
                 let auth = match method {
                     BedrockAuthMethod::Automatic => BedrockAuth::Automatic,
                     BedrockAuthMethod::NamedProfile => BedrockAuth::NamedProfile { profile_name },
-                    BedrockAuthMethod::SingleSignOn => BedrockAuth::SingleSignOn { profile_name },
                     BedrockAuthMethod::ApiKey => {
                         // ApiKey method means "use static credentials from keychain/env"
                         // Fall through to load them below
@@ -3403,24 +3377,19 @@ struct ConfigurationView {
     load_profiles_task: Option<Task<()>>,
     authentication_error: Option<SharedString>,
     profile_error: Option<SharedString>,
+    pending_auth_selection: Option<BedrockAuthSelection>,
     focus_handle: FocusHandle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BedrockAuthSelection {
     Automatic,
-    NamedProfile,
-    SingleSignOn,
+    Profile,
     StaticCredentials,
 }
 
 impl BedrockAuthSelection {
-    const ALL: [Self; 4] = [
-        Self::Automatic,
-        Self::NamedProfile,
-        Self::SingleSignOn,
-        Self::StaticCredentials,
-    ];
+    const ALL: [Self; 3] = [Self::Automatic, Self::Profile, Self::StaticCredentials];
 
     fn from_state(state: &State) -> Self {
         match state
@@ -3429,13 +3398,11 @@ impl BedrockAuthSelection {
             .and_then(|settings| settings.authentication_method.as_ref())
         {
             Some(BedrockAuthMethod::Automatic) => Self::Automatic,
-            Some(BedrockAuthMethod::NamedProfile) => Self::NamedProfile,
-            Some(BedrockAuthMethod::SingleSignOn) => Self::SingleSignOn,
+            Some(BedrockAuthMethod::NamedProfile) => Self::Profile,
             Some(BedrockAuthMethod::ApiKey) => Self::StaticCredentials,
             None => match state.auth {
                 Some(BedrockAuth::Automatic) => Self::Automatic,
-                Some(BedrockAuth::NamedProfile { .. }) => Self::NamedProfile,
-                Some(BedrockAuth::SingleSignOn { .. }) => Self::SingleSignOn,
+                Some(BedrockAuth::NamedProfile { .. }) => Self::Profile,
                 _ => Self::StaticCredentials,
             },
         }
@@ -3444,8 +3411,7 @@ impl BedrockAuthSelection {
     fn label(self) -> &'static str {
         match self {
             Self::Automatic => "Automatic (AWS credential chain)",
-            Self::NamedProfile => "AWS profile",
-            Self::SingleSignOn => "AWS SSO profile",
+            Self::Profile => "AWS Profile",
             Self::StaticCredentials => "Static credentials or API key",
         }
     }
@@ -3453,18 +3419,13 @@ impl BedrockAuthSelection {
     fn settings_value(self) -> settings::BedrockAuthMethodContent {
         match self {
             Self::Automatic => settings::BedrockAuthMethodContent::Automatic,
-            Self::NamedProfile => settings::BedrockAuthMethodContent::NamedProfile,
-            Self::SingleSignOn => settings::BedrockAuthMethodContent::SingleSignOn,
+            Self::Profile => settings::BedrockAuthMethodContent::NamedProfile,
             Self::StaticCredentials => settings::BedrockAuthMethodContent::ApiKey,
         }
     }
 
-    fn profile_kind(self) -> Option<AwsProfileKind> {
-        match self {
-            Self::NamedProfile => Some(AwsProfileKind::Credentials),
-            Self::SingleSignOn => Some(AwsProfileKind::SingleSignOn),
-            Self::Automatic | Self::StaticCredentials => None,
-        }
+    fn uses_profile(self) -> bool {
+        self == Self::Profile
     }
 }
 
@@ -3516,8 +3477,12 @@ impl ConfigurationView {
         let focus_handle = cx.focus_handle();
 
         cx.observe(&state, |this, state, cx| {
-            if state.read(cx).is_authenticated() {
+            let state = state.read(cx);
+            if state.is_authenticated() {
                 this.authentication_error = None;
+            }
+            if this.pending_auth_selection == Some(BedrockAuthSelection::from_state(state)) {
+                this.pending_auth_selection = None;
             }
             cx.notify();
         })
@@ -3600,7 +3565,22 @@ impl ConfigurationView {
             load_profiles_task,
             authentication_error: None,
             profile_error: None,
+            pending_auth_selection: None,
             focus_handle,
+        }
+    }
+
+    fn select_authentication_mode(
+        &mut self,
+        selection: BedrockAuthSelection,
+        cx: &mut Context<Self>,
+    ) {
+        if selection.uses_profile() {
+            self.pending_auth_selection = Some(selection);
+            cx.notify();
+        } else {
+            self.pending_auth_selection = None;
+            Self::persist_authentication(selection, None, cx);
         }
     }
 
@@ -3668,43 +3648,31 @@ impl ConfigurationView {
     ) -> AnyElement {
         let (selection, profile_name, region) = {
             let state = self.state.read(cx);
-            let selection = BedrockAuthSelection::from_state(state);
+            let selection = self
+                .pending_auth_selection
+                .unwrap_or_else(|| BedrockAuthSelection::from_state(state));
             let profile_name = state
                 .settings
                 .as_ref()
                 .and_then(|settings| settings.profile_name.clone())
                 .or_else(|| match state.auth.as_ref() {
-                    Some(BedrockAuth::NamedProfile { profile_name })
-                    | Some(BedrockAuth::SingleSignOn { profile_name }) => {
-                        Some(profile_name.clone())
-                    }
+                    Some(BedrockAuth::NamedProfile { profile_name }) => Some(profile_name.clone()),
                     _ => None,
                 });
             (selection, profile_name, state.get_region())
         };
 
-        let profiles = self.aws_profiles.clone();
-        let auth_profile_name = profile_name.clone();
+        let view = cx.entity();
         let auth_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
             for candidate in BedrockAuthSelection::ALL {
-                let profile_name = candidate.profile_kind().map(|kind| {
-                    if candidate == selection {
-                        auth_profile_name
-                            .clone()
-                            .unwrap_or_else(|| "default".to_string())
-                    } else {
-                        profiles
-                            .iter()
-                            .find(|profile| profile.kind == kind)
-                            .map(|profile| profile.name.clone())
-                            .unwrap_or_else(|| "default".to_string())
-                    }
-                });
+                let view = view.clone();
                 menu.push_item(
                     ContextMenuEntry::new(candidate.label())
                         .toggleable(IconPosition::End, candidate == selection)
                         .handler(move |_, cx| {
-                            Self::persist_authentication(candidate, profile_name.clone(), cx);
+                            view.update(cx, |this, cx| {
+                                this.select_authentication_mode(candidate, cx)
+                            });
                         }),
                 );
             }
@@ -3721,37 +3689,33 @@ impl ConfigurationView {
         .tab_index(0)
         .aria_label("Amazon Bedrock authentication method")
         .aria_description(
-            "Choose the AWS credential chain, a local AWS profile, an SSO profile, or static credentials.",
+            "Choose the AWS credential chain, any local AWS profile including SSO, or static credentials.",
         )
         .aria_value(selection.label());
 
-        let profile_control = selection.profile_kind().map(|kind| {
-            let matching_profiles = self
-                .aws_profiles
-                .iter()
-                .filter(|profile| profile.kind == kind)
-                .cloned()
-                .collect::<Vec<_>>();
+        let profile_control = selection.uses_profile().then(|| {
+            let profiles = self.aws_profiles.clone();
             let current_profile = profile_name
                 .clone()
-                .unwrap_or_else(|| "default".to_string());
-            let has_profiles = !matching_profiles.is_empty();
+                .or_else(|| profiles.first().map(|profile| profile.name.clone()))
+                .unwrap_or_else(|| "No local AWS profiles".to_string());
+            let has_profiles = !profiles.is_empty();
             let profile_menu = ContextMenu::build(window, cx, {
                 let current_profile = current_profile.clone();
                 move |mut menu, _, _| {
-                    if matching_profiles.is_empty() {
+                    if profiles.is_empty() {
                         menu.push_item(
                             ContextMenuEntry::new("No local profiles found").disabled(true),
                         );
                     } else {
-                        for profile in matching_profiles.iter() {
+                        for profile in profiles.iter() {
                             let profile_name = profile.name.clone();
                             menu.push_item(
                                 ContextMenuEntry::new(profile.name.clone())
                                     .toggleable(IconPosition::End, profile.name == current_profile)
                                     .handler(move |_, cx| {
                                         Self::persist_authentication(
-                                            selection,
+                                            BedrockAuthSelection::Profile,
                                             Some(profile_name.clone()),
                                             cx,
                                         );
@@ -3766,14 +3730,12 @@ impl ConfigurationView {
             let disabled = loading || !has_profiles;
             let disabled_reason = if loading {
                 "Local AWS profiles are still loading."
-            } else if kind == AwsProfileKind::SingleSignOn {
-                "No AWS SSO profiles were found in your AWS config files."
             } else {
-                "No AWS credential profiles were found in your AWS config files."
+                "No AWS profiles were found in your AWS config or credentials files."
             };
             v_flex()
                 .gap_1()
-                .child(Label::new("AWS profile").size(LabelSize::Small))
+                .child(Label::new("AWS Profile").size(LabelSize::Small))
                 .child(
                     DropdownMenu::new(
                         "bedrock-profile",
@@ -3788,7 +3750,7 @@ impl ConfigurationView {
                     .full_width(true)
                     .tab_index(1)
                     .disabled(disabled)
-                    .aria_label("AWS profile")
+                    .aria_label("AWS Profile")
                     .aria_description(if disabled {
                         disabled_reason
                     } else {
@@ -4059,7 +4021,8 @@ impl Render for ConfigurationView {
             (
                 state.credentials_from_env,
                 state.auth.clone(),
-                BedrockAuthSelection::from_state(state),
+                self.pending_auth_selection
+                    .unwrap_or_else(|| BedrockAuthSelection::from_state(state)),
                 state.is_authenticated(),
             )
         };
@@ -4070,9 +4033,6 @@ impl Render for ConfigurationView {
             }
             Some(BedrockAuth::NamedProfile { profile_name }) => {
                 format!("Using AWS profile: {profile_name}")
-            }
-            Some(BedrockAuth::SingleSignOn { profile_name }) => {
-                format!("Using AWS SSO profile: {profile_name}")
             }
             Some(BedrockAuth::IamCredentials { .. }) if env_var_set => {
                 format!(
@@ -4344,7 +4304,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aws_profile_discovery_merges_and_classifies_profiles() {
+    fn test_aws_profile_discovery_merges_all_profile_types() {
         use aws_runtime::env_config::file::EnvConfigFileKind;
 
         let files = EnvConfigFiles::builder()
@@ -4371,49 +4331,91 @@ mod tests {
             vec![
                 AwsProfile {
                     name: "default".to_string(),
-                    kind: AwsProfileKind::Credentials,
                 },
                 AwsProfile {
                     name: "sso".to_string(),
-                    kind: AwsProfileKind::SingleSignOn,
                 },
                 AwsProfile {
                     name: "static".to_string(),
-                    kind: AwsProfileKind::Credentials,
                 },
             ]
         );
     }
 
     #[test]
-    fn test_bedrock_auth_selection_uses_settings_schema_values() {
+    fn test_v39_bedrock_auth_selection_unifies_profiles() {
+        assert_eq!(
+            BedrockAuthSelection::ALL.to_vec(),
+            vec![
+                BedrockAuthSelection::Automatic,
+                BedrockAuthSelection::Profile,
+                BedrockAuthSelection::StaticCredentials,
+            ],
+            "CLI/IAM and SSO profiles must share one AWS Profile option",
+        );
+        let legacy_sso: settings::BedrockAuthMethodContent =
+            serde_json::from_value(serde_json::json!("sso"))
+                .expect("deserialize legacy sso authentication method");
+        assert_eq!(
+            serde_json::to_value(&legacy_sso).expect("normalize legacy sso authentication method"),
+            serde_json::json!("named_profile")
+        );
+        assert_eq!(
+            BedrockAuthMethod::from(legacy_sso),
+            BedrockAuthMethod::NamedProfile,
+            "legacy sso settings must normalize to AWS Profile",
+        );
+        let schema =
+            serde_json::to_value(schemars::schema_for!(settings::BedrockAuthMethodContent))
+                .expect("serialize Bedrock authentication schema");
+        assert!(
+            !schema.to_string().contains("\"sso\""),
+            "legacy sso alias must not remain a separate schema option",
+        );
         assert_eq!(
             serde_json::to_value(BedrockAuthSelection::Automatic.settings_value())
                 .expect("serialize automatic authentication"),
             serde_json::json!("default")
         );
         assert_eq!(
-            serde_json::to_value(BedrockAuthSelection::NamedProfile.settings_value())
+            serde_json::to_value(BedrockAuthSelection::Profile.settings_value())
                 .expect("serialize named-profile authentication"),
             serde_json::json!("named_profile")
-        );
-        assert_eq!(
-            serde_json::to_value(BedrockAuthSelection::SingleSignOn.settings_value())
-                .expect("serialize SSO authentication"),
-            serde_json::json!("sso")
         );
         assert_eq!(
             serde_json::to_value(BedrockAuthSelection::StaticCredentials.settings_value())
                 .expect("serialize static authentication"),
             serde_json::json!("api_key")
         );
+        assert!(BedrockAuthSelection::Profile.uses_profile());
+        assert!(!BedrockAuthSelection::Automatic.uses_profile());
+    }
+
+    #[gpui::test]
+    fn test_bedrock_profile_settings_update_is_non_panicking(cx: &mut App) {
+        let store = SettingsStore::new(cx, &settings::default_settings());
+        let updated = store
+            .new_text_for_update("{}".to_string(), |settings| {
+                let bedrock = settings
+                    .language_models
+                    .get_or_insert_default()
+                    .bedrock
+                    .get_or_insert_default();
+                bedrock.authentication_method =
+                    Some(settings::BedrockAuthMethodContent::NamedProfile);
+                bedrock.profile = Some("company-sso".to_string());
+            })
+            .expect("persist profile authentication settings");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&updated).expect("parse updated settings");
         assert_eq!(
-            BedrockAuthSelection::NamedProfile.profile_kind(),
-            Some(AwsProfileKind::Credentials)
+            value.pointer("/language_models/bedrock/authentication_method"),
+            Some(&serde_json::json!("named_profile"))
         );
         assert_eq!(
-            BedrockAuthSelection::SingleSignOn.profile_kind(),
-            Some(AwsProfileKind::SingleSignOn)
+            value.pointer("/language_models/bedrock/profile"),
+            Some(&serde_json::json!("company-sso"))
         );
     }
 

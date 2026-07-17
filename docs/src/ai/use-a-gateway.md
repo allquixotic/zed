@@ -151,15 +151,12 @@ Bedrock supports Zed-prefixed AWS environment variables so Zed does not override
 Open Agent Settings with {#action agent::OpenSettings} and select Amazon Bedrock. You can choose:
 
 - **Automatic (AWS credential chain)** to use the standard AWS SDK credential chain, including environment, container, and instance credentials.
-- **AWS profile** to select a named profile loaded from your local AWS config and credentials files.
-- **AWS SSO profile** to select an IAM Identity Center profile and use the AWS SDK's SSO credential provider and refresh behavior.
+- **AWS Profile** to select any profile loaded from your local AWS config and credentials files, including IAM Identity Center (SSO) profiles.
 - **Static credentials or API key** to store an access key pair, temporary IAM credentials, or a Bedrock API key in the system keychain.
 
 Select an AWS Region in the same view. Zed uses that Region for Bedrock Runtime and Mantle model discovery, shows the status of both catalogs, and lets you retry a failed discovery. `ZED_AWS_REGION` overrides the selector until the environment variable is unset and Zed is restarted.
 
-The controls write the same settings available in `settings.json`. For example, a named profile uses:
-
-For a named profile, configure Bedrock in settings:
+The controls write the same settings available in `settings.json`. Configure any CLI/IAM or SSO profile with `named_profile`:
 
 ```json [settings]
 {
@@ -173,7 +170,7 @@ For a named profile, configure Bedrock in settings:
 }
 ```
 
-Use `"authentication_method": "sso"` for an SSO profile, `"default"` for the automatic credential chain, or `"api_key"` for credentials stored in the keychain.
+Use `"authentication_method": "default"` for the automatic credential chain or `"api_key"` for credentials stored in the keychain. Existing `"sso"` settings remain compatible and are normalized to `"named_profile"`.
 
 For a Bedrock API key, choose **Static credentials or API key**, then enter the key in the Bedrock API Key field. The equivalent settings are:
 
