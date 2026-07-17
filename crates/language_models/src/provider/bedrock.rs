@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -36,7 +37,8 @@ use futures::{
     stream::BoxStream,
 };
 use gpui::{
-    App, AsyncApp, Context, Entity, FocusHandle, Subscription, Task, TaskExt, Window, actions,
+    App, AppContext, AsyncApp, Context, Entity, FocusHandle, Subscription, Task, TaskExt, Window,
+    actions,
 };
 use gpui_tokio::Tokio;
 use http_client::{
@@ -1015,12 +1017,12 @@ impl State {
         self.mantle_discovery_error = None;
         self.mantle_endpoint_available = Some(mantle_endpoint_available);
         self.discovery_in_progress = true;
-        self.discovery_task = cx.spawn(async move |this, cx| {
+        let discovery_task = spawn_bedrock_discovery(cx, async move {
             let session = session_cache
                 .cell
                 .get_or_try_init(|| build_aws_session(configuration, aws_http_client))
                 .await;
-            let (runtime_result, mantle_result) = match session {
+            match session {
                 Ok(session) => {
                     let runtime_source = AwsRuntimeCatalogSource {
                         client: session.control_client.clone(),
@@ -1045,7 +1047,11 @@ impl State {
                     let error = format!("initializing Bedrock session: {error}");
                     (Err(anyhow!(error.clone())), Err(anyhow!(error)))
                 }
-            };
+            }
+        });
+        self.discovery_task = cx.spawn(async move |this, cx| {
+            let (runtime_result, mantle_result) =
+                contain_bedrock_discovery_task_failure(discovery_task.await);
 
             if let Err(error) = this.update(cx, |this, cx| {
                 match runtime_result {
@@ -1356,6 +1362,30 @@ impl State {
         self.settings.as_ref().map_or((None, None), |s| {
             (s.guardrail_identifier.clone(), s.guardrail_version.clone())
         })
+    }
+}
+
+fn spawn_bedrock_discovery<C, F, R>(cx: &C, future: F) -> Task<Result<R>>
+where
+    C: AppContext,
+    F: Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    Tokio::spawn_result(cx, async move { Ok(future.await) })
+}
+
+type BedrockDiscoveryResult = Result<Vec<BedrockTargetDescriptor>>;
+type BedrockDiscoveryResults = (BedrockDiscoveryResult, BedrockDiscoveryResult);
+
+fn contain_bedrock_discovery_task_failure(
+    task_result: Result<BedrockDiscoveryResults>,
+) -> BedrockDiscoveryResults {
+    match task_result {
+        Ok(results) => results,
+        Err(error) => {
+            let error = format!("running Bedrock discovery: {error:#}");
+            (Err(anyhow!(error.clone())), Err(anyhow!(error)))
+        }
     }
 }
 
@@ -4278,6 +4308,7 @@ impl ConfigurationView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
     use language_model::{
         LanguageModelRequestMessage, LanguageModelToolResult, LanguageModelToolUseId,
     };
@@ -4416,6 +4447,38 @@ mod tests {
         assert_eq!(
             value.pointer("/language_models/bedrock/profile"),
             Some(&serde_json::json!("company-sso"))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_v40_bedrock_discovery_runs_on_tokio(cx: &mut TestAppContext) {
+        cx.update(gpui_tokio::init);
+        cx.executor().allow_parking();
+        let discovery_task = cx.update(|cx| {
+            spawn_bedrock_discovery(cx, async { tokio::runtime::Handle::try_current().is_ok() })
+        });
+
+        assert!(
+            discovery_task.await.expect("run Bedrock discovery"),
+            "Bedrock Runtime and Mantle discovery must run on Tokio"
+        );
+    }
+
+    #[test]
+    fn test_v40_bedrock_discovery_task_failure_is_contained() {
+        let (runtime_result, mantle_result) =
+            contain_bedrock_discovery_task_failure(Err(anyhow!("synthetic task panic")));
+        assert!(
+            runtime_result
+                .expect_err("Runtime discovery must receive the task error")
+                .to_string()
+                .contains("synthetic task panic")
+        );
+        assert!(
+            mantle_result
+                .expect_err("Mantle discovery must receive the task error")
+                .to_string()
+                .contains("synthetic task panic")
         );
     }
 
