@@ -76,6 +76,18 @@ impl WindowsRenderer {
     pub(crate) fn is_software(&self) -> bool {
         matches!(self, Self::Software(_))
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn render_to_image(
+        &mut self,
+        scene: &Scene,
+        background: WindowBackgroundAppearance,
+    ) -> Result<image::RgbaImage> {
+        match self {
+            Self::DirectX(renderer) => renderer.render_to_image(scene, background),
+            Self::Software(renderer) => renderer.render_to_image(scene),
+        }
+    }
 }
 
 pub(crate) struct SoftwareWindowRenderer {
@@ -120,6 +132,26 @@ impl SoftwareWindowRenderer {
 
     fn resize(&mut self, size: Size<DevicePixels>) {
         self.renderer.resize(size);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&mut self, scene: &Scene) -> Result<image::RgbaImage> {
+        self.renderer.draw(scene, true);
+        let framebuffer = self.renderer.framebuffer();
+        let size = framebuffer.size();
+        let width = size.width.0.max(0) as u32;
+        let height = size.height.0.max(0) as u32;
+        let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+        for pixel in framebuffer.pixels() {
+            rgba.extend_from_slice(&[
+                (pixel >> 16) as u8,
+                (pixel >> 8) as u8,
+                *pixel as u8,
+                (pixel >> 24) as u8,
+            ]);
+        }
+        image::RgbaImage::from_raw(width, height, rgba)
+            .context("Failed to build RgbaImage from software framebuffer")
     }
 
     fn include_update_rect(&self, damage: &mut Damage) {

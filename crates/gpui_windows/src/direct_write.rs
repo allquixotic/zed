@@ -1063,6 +1063,7 @@ impl DirectWriteState {
             bitmap_size,
             &render_target_texture,
             &render_target_view,
+            components.font_correction,
         )
     }
 
@@ -1072,6 +1073,7 @@ impl DirectWriteState {
         bitmap_size: Size<DevicePixels>,
         render_target_texture: &ID3D11Texture2D,
         render_target_view: &Option<ID3D11RenderTargetView>,
+        font_correction: gpui_software::FontCorrection,
     ) -> Result<Vec<u8>> {
         let params_buffer = {
             let desc = D3D11_BUFFER_DESC {
@@ -1138,8 +1140,8 @@ impl DirectWriteState {
         unsafe { device_context.PSSetSamplers(0, Some(std::slice::from_ref(&gpu_state.sampler))) };
         unsafe { device_context.OMSetBlendState(&gpu_state.blend_state, None, 0xffffffff) };
 
-        let gamma_ratios = components.font_correction.gamma_ratios;
-        let grayscale_enhanced_contrast = components.font_correction.grayscale_enhanced_contrast;
+        let gamma_ratios = font_correction.gamma_ratios;
+        let grayscale_enhanced_contrast = font_correction.grayscale_enhanced_contrast;
 
         for layer in glyph_layers {
             let params = GlyphLayerTextureParams {
@@ -2054,7 +2056,9 @@ const DEFAULT_LOCALE_NAME: PCWSTR = windows::core::w!("en-US");
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectWriteState, DirectWriteTextSystem, GPUState, GlyphLayerTexture};
+    use super::{
+        ColorGlyphLayer, DirectWriteState, DirectWriteTextSystem, GPUState, GlyphLayerTexture,
+    };
     use crate::direct_write::ClusterAnalyzer;
     use crate::directx_devices::DirectXDevices;
     use anyhow::Result;
@@ -2109,7 +2113,8 @@ mod tests {
     #[test]
     fn color_emoji_rasterization_is_stable_across_batches() -> Result<()> {
         let devices = DirectXDevices::new()?;
-        let text_system = DirectWriteTextSystem::new(&devices)?;
+        let text_system =
+            DirectWriteTextSystem::new(Some(&devices), gpui_software::FontCorrection::default())?;
 
         let font = Font {
             family: "Segoe UI Emoji".into(),
@@ -2231,17 +2236,17 @@ mod tests {
         // A single opaque layer in the top-left corner; the bottom-right corner
         // of the texture is covered by no layer at all.
         let layer_alpha = vec![255u8; 4 * 4];
-        let layer = GlyphLayerTexture::new(
-            &gpu_state,
-            Rgba {
+        let layer = ColorGlyphLayer {
+            run_color: Rgba {
                 r: 1.0,
                 g: 1.0,
                 b: 1.0,
                 a: 1.0,
             },
-            bounds(point(0, 0), size(4, 4)),
-            &layer_alpha,
-        )?;
+            bounds: bounds(point(0, 0), size(4, 4)),
+            alpha_data: layer_alpha,
+        };
+        let layer = GlyphLayerTexture::new(&gpu_state, &layer)?;
 
         let rasterized = DirectWriteState::composite_color_layers(
             &gpu_state,
@@ -2249,6 +2254,7 @@ mod tests {
             size(DevicePixels(SIZE as i32), DevicePixels(SIZE as i32)),
             &texture,
             &Some(render_target_view),
+            gpui_software::FontCorrection::default(),
         )?;
 
         let corner = (SIZE as usize - 1 + (SIZE as usize - 1) * SIZE as usize) * 4;
