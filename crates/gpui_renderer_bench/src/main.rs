@@ -66,6 +66,7 @@ Usage:
       [--warmup-frames N] [--measure-frames N] [--revision LABEL]
   gpui-renderer-bench compare --output-dir PATH [--rounds N]
       [--baseline-exe PATH] [--candidate-exe PATH]
+      [--baseline-revision LABEL] [--candidate-revision LABEL]
       [--width PX] [--height PX] [--warmup-frames N] [--measure-frames N]
   gpui-renderer-bench summarize --input-dir PATH [--output-dir PATH]
 
@@ -91,6 +92,8 @@ struct CompareOptions {
     rounds: usize,
     baseline_executable: Option<PathBuf>,
     candidate_executable: Option<PathBuf>,
+    baseline_revision: String,
+    candidate_revision: String,
     run: RunOptions,
 }
 
@@ -121,6 +124,14 @@ fn parse_compare_options(arguments: &[OsString]) -> Result<CompareOptions> {
         rounds: optional_number(&values, "rounds", 3)?,
         baseline_executable: values.get("baseline-exe").map(PathBuf::from),
         candidate_executable: values.get("candidate-exe").map(PathBuf::from),
+        baseline_revision: values
+            .get("baseline-revision")
+            .map(|value| value.to_string_lossy().into())
+            .unwrap_or_else(|| "upstream-or-legacy".to_owned()),
+        candidate_revision: values
+            .get("candidate-revision")
+            .map(|value| value.to_string_lossy().into())
+            .unwrap_or_else(|| "gpui-software".to_owned()),
         run: RunOptions {
             output: output_dir.join("unused.json"),
             width: optional_number(&values, "width", DEFAULT_WIDTH)?,
@@ -223,7 +234,7 @@ struct BenchmarkReport {
     scenarios: Vec<ScenarioReport>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 struct GpuReport {
     is_software_emulated: bool,
     device_name: String,
@@ -463,7 +474,7 @@ impl BenchmarkDriver {
             .or_else(|| env::var("GPUI_BENCHMARK_REVISION").ok())
             .unwrap_or_else(|| "unknown".to_owned());
         let report = BenchmarkReport {
-            schema_version: 1,
+            schema_version: 2,
             label: env::var("GPUI_BENCHMARK_LABEL").unwrap_or_else(|_| "unlabeled".to_owned()),
             revision,
             executable,
@@ -877,6 +888,8 @@ fn compare(options: CompareOptions) -> Result<()> {
             rounds,
             baseline_executable,
             candidate_executable,
+            baseline_revision,
+            candidate_revision,
             run,
         } = options;
         let _ = (
@@ -884,6 +897,8 @@ fn compare(options: CompareOptions) -> Result<()> {
             rounds,
             baseline_executable,
             candidate_executable,
+            baseline_revision,
+            candidate_revision,
             run,
         );
         bail!(
@@ -931,14 +946,14 @@ fn compare_windows(options: CompareOptions) -> Result<()> {
                     &baseline_executable,
                     baseline_is_current.then_some("directx"),
                     Some("warp"),
-                    "upstream-or-legacy",
+                    options.baseline_revision.as_str(),
                 )
             } else {
                 (
                     &candidate_executable,
                     Some("software"),
                     None,
-                    "gpui-software",
+                    options.candidate_revision.as_str(),
                 )
             };
             run_child(
@@ -1059,8 +1074,26 @@ fn read_report(path: &Path) -> Result<BenchmarkReport> {
 struct ComparisonSummary {
     schema_version: u32,
     reports: usize,
+    runs: Vec<RunSummary>,
     groups: Vec<SummaryGroup>,
     comparisons: Vec<ComparisonDelta>,
+}
+
+#[derive(Serialize)]
+struct RunSummary {
+    label: String,
+    revision: String,
+    report_count: usize,
+    operating_system: String,
+    architecture: String,
+    logical_cpu_count: usize,
+    requested_renderer: Option<String>,
+    requested_directx_adapter: Option<String>,
+    gpu: Option<GpuReport>,
+    viewport_width: f32,
+    viewport_height: f32,
+    warmup_frames: usize,
+    measure_frames: usize,
 }
 
 #[derive(Serialize)]
@@ -1134,6 +1167,7 @@ fn summarize(options: SummarizeOptions) -> Result<()> {
 }
 
 fn build_summary(reports: &[BenchmarkReport]) -> Result<ComparisonSummary> {
+    let runs = build_run_summaries(reports)?;
     let mut grouped: BTreeMap<(String, Scenario), Vec<&ScenarioReport>> = BTreeMap::new();
     for report in reports {
         for scenario in &report.scenarios {
@@ -1204,11 +1238,74 @@ fn build_summary(reports: &[BenchmarkReport]) -> Result<ComparisonSummary> {
     }
     let comparisons = build_comparisons(&groups);
     Ok(ComparisonSummary {
-        schema_version: 1,
+        schema_version: 2,
         reports: reports.len(),
+        runs,
         groups,
         comparisons,
     })
+}
+
+fn build_run_summaries(reports: &[BenchmarkReport]) -> Result<Vec<RunSummary>> {
+    let first_report = reports
+        .first()
+        .ok_or_else(|| anyhow!("cannot summarize an empty report set"))?;
+    let mut by_label: BTreeMap<&str, Vec<&BenchmarkReport>> = BTreeMap::new();
+    for report in reports {
+        if report.operating_system != first_report.operating_system
+            || report.architecture != first_report.architecture
+            || report.logical_cpu_count != first_report.logical_cpu_count
+            || report.window.requested_width != first_report.window.requested_width
+            || report.window.requested_height != first_report.window.requested_height
+            || report.warmup_frames != first_report.warmup_frames
+            || report.measure_frames != first_report.measure_frames
+        {
+            bail!("benchmark reports contain incompatible host or workload configurations");
+        }
+        if !report.window.active {
+            bail!("{} benchmark window was not active", report.label);
+        }
+        by_label.entry(&report.label).or_default().push(report);
+    }
+
+    by_label
+        .into_iter()
+        .map(|(label, reports)| {
+            let first = reports
+                .first()
+                .ok_or_else(|| anyhow!("{label} contains no benchmark reports"))?;
+            if reports.iter().any(|report| {
+                report.revision != first.revision
+                    || report.requested_renderer != first.requested_renderer
+                    || report.requested_directx_adapter != first.requested_directx_adapter
+                    || report.gpu != first.gpu
+                    || report.window.viewport_width != first.window.viewport_width
+                    || report.window.viewport_height != first.window.viewport_height
+            }) {
+                bail!("{label} reports contain incompatible renderer configurations");
+            }
+            Ok(RunSummary {
+                label: label.to_owned(),
+                revision: first.revision.clone(),
+                report_count: reports.len(),
+                operating_system: first.operating_system.clone(),
+                architecture: first.architecture.clone(),
+                logical_cpu_count: first.logical_cpu_count,
+                requested_renderer: first.requested_renderer.clone(),
+                requested_directx_adapter: first.requested_directx_adapter.clone(),
+                gpu: first.gpu.as_ref().map(|gpu| GpuReport {
+                    is_software_emulated: gpu.is_software_emulated,
+                    device_name: gpu.device_name.clone(),
+                    driver_name: gpu.driver_name.clone(),
+                    driver_info: gpu.driver_info.clone(),
+                }),
+                viewport_width: first.window.viewport_width,
+                viewport_height: first.window.viewport_height,
+                warmup_frames: first.warmup_frames,
+                measure_frames: first.measure_frames,
+            })
+        })
+        .collect()
 }
 
 fn build_comparisons(groups: &[SummaryGroup]) -> Vec<ComparisonDelta> {
@@ -1226,21 +1323,21 @@ fn build_comparisons(groups: &[SummaryGroup]) -> Vec<ComparisonDelta> {
         add_comparison(
             &mut comparisons,
             scenario,
-            "present p50 (ms)",
+            "render/submit p50 (ms)",
             baseline.renderer_present_ms.p50,
             candidate.renderer_present_ms.p50,
         );
         add_comparison(
             &mut comparisons,
             scenario,
-            "present p95 (ms)",
+            "render/submit p95 (ms)",
             baseline.renderer_present_ms.p95,
             candidate.renderer_present_ms.p95,
         );
         add_comparison(
             &mut comparisons,
             scenario,
-            "dirty-to-present p95 (ms)",
+            "dirty-to-submit p95 (ms)",
             baseline.dirty_to_present_ms.p95,
             candidate.dirty_to_present_ms.p95,
         );
@@ -1335,7 +1432,39 @@ fn percentile(values: &[u64], percentile: usize) -> u64 {
 
 fn summary_markdown(summary: &ComparisonSummary) -> String {
     let mut markdown = String::from(
-        "# GPUI renderer benchmark\n\nAll values are aggregated from raw per-frame samples. CPU cores is total process CPU time divided by wall time; 1.0 means one fully utilized logical core.\n\n| Renderer | Scenario | Frames | Present p50 (ms) | Present p95 (ms) | Dirty-to-present p95 (ms) | Frame interval p95 (ms) | CPU ms/frame | CPU cores |\n|---|---|---:|---:|---:|---:|---:|---:|---:|\n",
+        "# GPUI renderer benchmark\n\n## Run configuration\n\n| Renderer | Revision | OS | Architecture | Logical CPUs | Requested path | Device | Driver | Viewport | Reports |\n|---|---|---|---|---:|---|---|---|---|---:|\n",
+    );
+    for run in &summary.runs {
+        let requested_path = match (
+            run.requested_renderer.as_deref(),
+            run.requested_directx_adapter.as_deref(),
+        ) {
+            (Some(renderer), Some(adapter)) => format!("{renderer} / {adapter}"),
+            (Some(renderer), None) => renderer.to_owned(),
+            (None, Some(adapter)) => format!("automatic / {adapter}"),
+            (None, None) => "automatic".to_owned(),
+        };
+        let (device, driver) = run.gpu.as_ref().map_or_else(
+            || ("n/a".to_owned(), "n/a".to_owned()),
+            |gpu| (gpu.device_name.clone(), gpu.driver_name.clone()),
+        );
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.0}x{:.0} | {} |\n",
+            run.label,
+            run.revision,
+            run.operating_system,
+            run.architecture,
+            run.logical_cpu_count,
+            requested_path,
+            device,
+            driver,
+            run.viewport_width,
+            run.viewport_height,
+            run.report_count,
+        ));
+    }
+    markdown.push_str(
+        "\n## Results\n\nAll values are aggregated from raw per-frame samples. CPU cores is total process CPU time divided by wall time; 1.0 means one fully utilized logical core. Render/submit is time inside the platform call, not necessarily asynchronous DirectX completion time.\n\n| Renderer | Scenario | Frames | Render/submit p50 (ms) | Render/submit p95 (ms) | Dirty-to-submit p95 (ms) | Frame interval p95 (ms) | CPU ms/frame | CPU cores |\n|---|---|---:|---:|---:|---:|---:|---:|---:|\n",
     );
     for group in &summary.groups {
         markdown.push_str(&format!(

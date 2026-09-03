@@ -31,6 +31,8 @@ For the strictest upstream comparison, apply the benchmark-only commit to an unm
   --output-dir .\target\renderer-benchmark-results `
   --baseline-exe .\upstream\gpui-renderer-bench.exe `
   --candidate-exe .\candidate\gpui-renderer-bench.exe `
+  --baseline-revision UPSTREAM_GIT_SHA `
+  --candidate-revision CANDIDATE_GIT_SHA `
   --rounds 3
 ```
 
@@ -45,7 +47,7 @@ The scenarios are:
 - `scroll`: advances the complete visible text viewport by one line;
 - `full_frame`: changes the window and panel backgrounds.
 
-`draw_ns` measures GPUI render-tree, layout, text, and scene construction. `renderer_present_ns` measures the platform renderer and submission/presentation call. `dirty_to_present_ns` measures from invalidation through presentation. Process CPU includes worker threads used by WARP or `gpui_software`.
+`draw_ns` measures GPUI render-tree, layout, text, and scene construction. `renderer_present_ns` measures the platform renderer and submission/presentation call; DirectX can return before asynchronous WARP work completes, so this is labeled render/submit rather than completed-render time in the summary. `dirty_to_present_ns` measures from invalidation through that submission. Process CPU includes worker threads used by WARP or `gpui_software`, and frame interval measures the observable presentation cadence.
 
 On macOS, `run` can verify that the workload and reporting are portable, but the result uses Metal and is not a valid no-GPU baseline. macOS has no upstream software Metal fallback corresponding to the Windows software DXGI adapter. A second cross-platform A/B should use Linux with llvmpipe once the `gpui_software` Linux presenter is available.
 
