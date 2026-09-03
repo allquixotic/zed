@@ -20,14 +20,16 @@ use gpui::{
 };
 use serde::{Deserialize, Serialize};
 
-#[cfg(target_os = "windows")]
-use std::process::{Child, Command, ExitStatus};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use smol::process::{Child, Command};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::process::ExitStatus;
 
 const DEFAULT_WIDTH: f32 = 1600.0;
 const DEFAULT_HEIGHT: f32 = 900.0;
 const DEFAULT_WARMUP_FRAMES: usize = 30;
 const DEFAULT_MEASURE_FRAMES: usize = 180;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const DEFAULT_CHILD_TIMEOUT: Duration = Duration::from_secs(240);
 const STABILIZATION_FRAMES: usize = 10;
 
@@ -70,10 +72,11 @@ Usage:
       [--width PX] [--height PX] [--warmup-frames N] [--measure-frames N]
   gpui-renderer-bench summarize --input-dir PATH [--output-dir PATH]
 
-On Windows, compare forces the legacy DirectX path for the baseline when both
-sides use the current executable. If --baseline-exe is supplied, that executable
-runs with GPUI_RENDERER unset so an unmodified upstream build chooses its normal
-fallback. The candidate always runs with GPUI_RENDERER=software."
+On Windows, compare forces DirectX/WARP for a same-executable baseline. On Linux,
+it forces WGPU and requires a software-emulated adapter on Wayland. If
+--baseline-exe is supplied, that executable runs with GPUI_RENDERER unset so an
+unmodified upstream build chooses its normal fallback. The candidate always runs
+with GPUI_RENDERER=software."
     );
 }
 
@@ -225,6 +228,8 @@ struct BenchmarkReport {
     operating_system: String,
     architecture: String,
     logical_cpu_count: usize,
+    #[serde(default)]
+    display_server: Option<String>,
     requested_renderer: Option<String>,
     requested_directx_adapter: Option<String>,
     gpu: Option<GpuReport>,
@@ -323,6 +328,7 @@ struct PendingFrame {
 }
 
 enum DriverAction {
+    AwaitActivation,
     Render { scenario: Scenario },
     Finish,
 }
@@ -363,6 +369,11 @@ impl BenchmarkDriver {
             });
         } else if let Some(window_report) = &mut self.window {
             window_report.active = window.is_window_active();
+        }
+
+        if !window.is_window_active() {
+            self.pending = None;
+            return Ok(DriverAction::AwaitActivation);
         }
 
         if let Some(pending) = self.pending.take() {
@@ -474,13 +485,14 @@ impl BenchmarkDriver {
             .or_else(|| env::var("GPUI_BENCHMARK_REVISION").ok())
             .unwrap_or_else(|| "unknown".to_owned());
         let report = BenchmarkReport {
-            schema_version: 2,
+            schema_version: 3,
             label: env::var("GPUI_BENCHMARK_LABEL").unwrap_or_else(|_| "unlabeled".to_owned()),
             revision,
             executable,
             operating_system: env::consts::OS.to_owned(),
             architecture: env::consts::ARCH.to_owned(),
             logical_cpu_count: thread::available_parallelism().map_or(1, usize::from),
+            display_server: display_server(),
             requested_renderer: env::var("GPUI_RENDERER").ok(),
             requested_directx_adapter: env::var("GPUI_D3D_ADAPTER").ok(),
             gpu: self.gpu.as_ref().map(|gpu| GpuReport {
@@ -636,6 +648,9 @@ fn schedule_benchmark_frame(
     window.on_next_frame(move |window, cx| {
         let action = driver.borrow_mut().on_frame(window);
         match action {
+            Ok(DriverAction::AwaitActivation) => {
+                schedule_benchmark_frame(window, view, driver);
+            }
             Ok(DriverAction::Render { scenario }) => {
                 view.update(cx, |view, cx| {
                     view.advance(scenario);
@@ -881,7 +896,7 @@ impl Render for EditorBenchmarkView {
 }
 
 fn compare(options: CompareOptions) -> Result<()> {
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let CompareOptions {
             output_dir,
@@ -902,15 +917,15 @@ fn compare(options: CompareOptions) -> Result<()> {
             run,
         );
         bail!(
-            "the no-GPU legacy-versus-gpui_software comparison is currently only valid on Windows"
+            "the no-GPU legacy-versus-gpui_software comparison is only valid on Windows or Linux"
         );
     }
-    #[cfg(target_os = "windows")]
-    compare_windows(options)
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    compare_supported_platform(options)
 }
 
-#[cfg(target_os = "windows")]
-fn compare_windows(options: CompareOptions) -> Result<()> {
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn compare_supported_platform(options: CompareOptions) -> Result<()> {
     if options.rounds == 0 {
         bail!("--rounds must be greater than zero");
     }
@@ -944,8 +959,8 @@ fn compare_windows(options: CompareOptions) -> Result<()> {
             let (executable, renderer, directx_adapter, revision) = if label == "baseline" {
                 (
                     &baseline_executable,
-                    baseline_is_current.then_some("directx"),
-                    Some("warp"),
+                    baseline_is_current.then_some(baseline_renderer()),
+                    baseline_directx_adapter(),
                     options.baseline_revision.as_str(),
                 )
             } else {
@@ -975,7 +990,7 @@ fn compare_windows(options: CompareOptions) -> Result<()> {
     })
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn run_child(
     executable: &Path,
     renderer: Option<&str>,
@@ -1021,18 +1036,18 @@ fn run_child(
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn wait_for_child(mut child: Child, timeout: Duration) -> Result<ExitStatus> {
     let started_at = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().context("checking benchmark child")? {
+        if let Some(status) = child.try_status().context("checking benchmark child")? {
             return Ok(status);
         }
         if started_at.elapsed() >= timeout {
             child
                 .kill()
                 .context("terminating timed-out benchmark child")?;
-            let _status = child.wait().context("reaping timed-out benchmark child")?;
+            smol::block_on(child.status()).context("reaping timed-out benchmark child")?;
             bail!(
                 "benchmark child exceeded the {} second timeout",
                 timeout.as_secs()
@@ -1042,13 +1057,21 @@ fn wait_for_child(mut child: Child, timeout: Duration) -> Result<ExitStatus> {
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn validate_comparison_report(label: &str, report: &BenchmarkReport) -> Result<()> {
     let gpu = report
         .gpu
         .as_ref()
         .ok_or_else(|| anyhow!("{label} report did not include renderer information"))?;
+    #[cfg(target_os = "linux")]
+    if report.display_server.as_deref() != Some("wayland") {
+        bail!(
+            "{label} did not run on Wayland; display server was {:?}",
+            report.display_server
+        );
+    }
     match label {
+        #[cfg(target_os = "windows")]
         "baseline" if report.requested_directx_adapter.as_deref() != Some("warp") => {
             bail!("baseline did not request the WARP adapter")
         }
@@ -1063,6 +1086,26 @@ fn validate_comparison_report(label: &str, report: &BenchmarkReport) -> Result<(
         ),
         _ => Ok(()),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn baseline_renderer() -> &'static str {
+    "directx"
+}
+
+#[cfg(target_os = "linux")]
+fn baseline_renderer() -> &'static str {
+    "wgpu"
+}
+
+#[cfg(target_os = "windows")]
+fn baseline_directx_adapter() -> Option<&'static str> {
+    Some("warp")
+}
+
+#[cfg(target_os = "linux")]
+fn baseline_directx_adapter() -> Option<&'static str> {
+    None
 }
 
 fn read_report(path: &Path) -> Result<BenchmarkReport> {
@@ -1087,6 +1130,7 @@ struct RunSummary {
     operating_system: String,
     architecture: String,
     logical_cpu_count: usize,
+    display_server: Option<String>,
     requested_renderer: Option<String>,
     requested_directx_adapter: Option<String>,
     gpu: Option<GpuReport>,
@@ -1238,7 +1282,7 @@ fn build_summary(reports: &[BenchmarkReport]) -> Result<ComparisonSummary> {
     }
     let comparisons = build_comparisons(&groups);
     Ok(ComparisonSummary {
-        schema_version: 2,
+        schema_version: 3,
         reports: reports.len(),
         runs,
         groups,
@@ -1255,6 +1299,7 @@ fn build_run_summaries(reports: &[BenchmarkReport]) -> Result<Vec<RunSummary>> {
         if report.operating_system != first_report.operating_system
             || report.architecture != first_report.architecture
             || report.logical_cpu_count != first_report.logical_cpu_count
+            || report.display_server != first_report.display_server
             || report.window.requested_width != first_report.window.requested_width
             || report.window.requested_height != first_report.window.requested_height
             || report.warmup_frames != first_report.warmup_frames
@@ -1291,6 +1336,7 @@ fn build_run_summaries(reports: &[BenchmarkReport]) -> Result<Vec<RunSummary>> {
                 operating_system: first.operating_system.clone(),
                 architecture: first.architecture.clone(),
                 logical_cpu_count: first.logical_cpu_count,
+                display_server: first.display_server.clone(),
                 requested_renderer: first.requested_renderer.clone(),
                 requested_directx_adapter: first.requested_directx_adapter.clone(),
                 gpu: first.gpu.as_ref().map(|gpu| GpuReport {
@@ -1432,7 +1478,7 @@ fn percentile(values: &[u64], percentile: usize) -> u64 {
 
 fn summary_markdown(summary: &ComparisonSummary) -> String {
     let mut markdown = String::from(
-        "# GPUI renderer benchmark\n\n## Run configuration\n\n| Renderer | Revision | OS | Architecture | Logical CPUs | Requested path | Device | Driver | Viewport | Reports |\n|---|---|---|---|---:|---|---|---|---|---:|\n",
+        "# GPUI renderer benchmark\n\n## Run configuration\n\n| Renderer | Revision | OS | Display server | Architecture | Logical CPUs | Requested path | Device | Driver | Viewport | Reports |\n|---|---|---|---|---|---:|---|---|---|---|---:|\n",
     );
     for run in &summary.runs {
         let requested_path = match (
@@ -1449,10 +1495,11 @@ fn summary_markdown(summary: &ComparisonSummary) -> String {
             |gpu| (gpu.device_name.clone(), gpu.driver_name.clone()),
         );
         markdown.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {:.0}x{:.0} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {:.0}x{:.0} | {} |\n",
             run.label,
             run.revision,
             run.operating_system,
+            run.display_server.as_deref().unwrap_or("n/a"),
             run.architecture,
             run.logical_cpu_count,
             requested_path,
@@ -1506,6 +1553,22 @@ fn summary_markdown(summary: &ComparisonSummary) -> String {
 
 fn format_optional(value: Option<f64>) -> String {
     value.map_or_else(|| "n/a".to_owned(), |value| format!("{value:.3}"))
+}
+
+#[cfg(target_os = "linux")]
+fn display_server() -> Option<String> {
+    if env::var_os("WAYLAND_DISPLAY").is_some() {
+        Some("wayland".to_owned())
+    } else if env::var_os("DISPLAY").is_some() {
+        Some("x11".to_owned())
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn display_server() -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "windows")]

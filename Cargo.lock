@@ -7737,6 +7737,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "smol",
  "windows 0.62.2",
 ]
 
