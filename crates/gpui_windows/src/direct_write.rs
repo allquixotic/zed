@@ -48,6 +48,7 @@ struct DirectWriteComponents {
     text_renderer: TextRendererWrapper,
     system_ui_font_name: SharedString,
     system_subpixel_rendering: bool,
+    font_correction: gpui_software::FontCorrection,
 }
 
 impl Drop for DirectWriteComponents {
@@ -70,7 +71,7 @@ struct GPUState {
 }
 
 struct DirectWriteState {
-    gpu_state: GPUState,
+    gpu_state: Option<GPUState>,
     system_font_collection: IDWriteFontCollection1,
     custom_font_collection: IDWriteFontCollection1,
     fonts: Vec<FontInfo>,
@@ -163,7 +164,10 @@ impl GPUState {
 }
 
 impl DirectWriteTextSystem {
-    pub(crate) fn new(directx_devices: &DirectXDevices) -> Result<Self> {
+    pub(crate) fn new(
+        directx_devices: Option<&DirectXDevices>,
+        font_correction: gpui_software::FontCorrection,
+    ) -> Result<Self> {
         let factory: IDWriteFactory5 = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         // The `IDWriteInMemoryFontFileLoader` here is supported starting from
         // Windows 10 Creators Update, which consequently requires the entire
@@ -176,7 +180,7 @@ impl DirectWriteTextSystem {
         let locale = HSTRING::from_wide(&locale);
         let text_renderer = TextRendererWrapper::new(locale.clone());
 
-        let gpu_state = GPUState::new(directx_devices)?;
+        let gpu_state = directx_devices.map(GPUState::new).transpose()?;
 
         let system_subpixel_rendering = get_system_subpixel_rendering();
         let system_ui_font_name = get_system_ui_font_name();
@@ -188,6 +192,7 @@ impl DirectWriteTextSystem {
             text_renderer,
             system_ui_font_name,
             system_subpixel_rendering,
+            font_correction,
         };
 
         let system_font_collection = unsafe {
@@ -980,12 +985,11 @@ impl DirectWriteState {
                         }
                     };
                     let bounds = bounds(point(color_bounds.left, color_bounds.top), color_size);
-                    glyph_layers.push(GlyphLayerTexture::new(
-                        &self.gpu_state,
+                    glyph_layers.push(ColorGlyphLayer {
                         run_color,
                         bounds,
-                        &alpha_data,
-                    )?);
+                        alpha_data: alpha_data.clone(),
+                    });
                 }
             }
 
@@ -997,7 +1001,17 @@ impl DirectWriteState {
             }
         }
 
-        let gpu_state = &self.gpu_state;
+        let Some(gpu_state) = &self.gpu_state else {
+            return Ok(rasterize_color_cpu(
+                bitmap_size,
+                &glyph_layers,
+                components.font_correction,
+            ));
+        };
+        let glyph_layers = glyph_layers
+            .iter()
+            .map(|layer| GlyphLayerTexture::new(gpu_state, layer))
+            .collect::<Result<Vec<_>>>()?;
         let params_buffer = {
             let desc = D3D11_BUFFER_DESC {
                 ByteWidth: std::mem::size_of::<GlyphLayerTextureParams>() as u32,
@@ -1102,18 +1116,15 @@ impl DirectWriteState {
         unsafe { device_context.PSSetSamplers(0, Some(std::slice::from_ref(&gpu_state.sampler))) };
         unsafe { device_context.OMSetBlendState(&gpu_state.blend_state, None, 0xffffffff) };
 
-        let crate::FontInfo {
-            gamma_ratios,
-            grayscale_enhanced_contrast,
-            ..
-        } = DirectXRenderer::get_font_info();
+        let gamma_ratios = components.font_correction.gamma_ratios;
+        let grayscale_enhanced_contrast = components.font_correction.grayscale_enhanced_contrast;
 
         for layer in glyph_layers {
             let params = GlyphLayerTextureParams {
                 run_color: layer.run_color,
                 bounds: layer.bounds,
-                gamma_ratios: *gamma_ratios,
-                grayscale_enhanced_contrast: *grayscale_enhanced_contrast,
+                gamma_ratios,
+                grayscale_enhanced_contrast,
                 _pad: [0f32; 3],
             };
             unsafe {
@@ -1259,11 +1270,106 @@ impl DirectWriteState {
     }
 
     fn handle_gpu_lost(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+        if self.gpu_state.is_none() {
+            return Ok(());
+        }
         try_to_recover_from_device_lost(|| {
             GPUState::new(directx_devices).context("Recreating GPU state for DirectWrite")
         })
-        .map(|gpu_state| self.gpu_state = gpu_state)
+        .map(|gpu_state| self.gpu_state = Some(gpu_state))
     }
+}
+
+struct ColorGlyphLayer {
+    run_color: Rgba,
+    bounds: Bounds<i32>,
+    alpha_data: Vec<u8>,
+}
+
+fn rasterize_color_cpu(
+    bitmap_size: Size<DevicePixels>,
+    layers: &[ColorGlyphLayer],
+    correction: gpui_software::FontCorrection,
+) -> Vec<u8> {
+    let width = bitmap_size.width.0.max(0) as usize;
+    let height = bitmap_size.height.0.max(0) as usize;
+    let mut rasterized = vec![0u8; width.saturating_mul(height).saturating_mul(4)];
+    for layer in layers {
+        let layer_width = layer.bounds.size.width.max(0) as usize;
+        let layer_height = layer.bounds.size.height.max(0) as usize;
+        for layer_y in 0..layer_height {
+            let destination_y = layer.bounds.origin.y + layer_y as i32;
+            if destination_y < 0 || destination_y >= bitmap_size.height.0 {
+                continue;
+            }
+            for layer_x in 0..layer_width {
+                let destination_x = layer.bounds.origin.x + layer_x as i32;
+                if destination_x < 0 || destination_x >= bitmap_size.width.0 {
+                    continue;
+                }
+                let source_index = layer_y * layer_width + layer_x;
+                let Some(sample) = layer.alpha_data.get(source_index).copied() else {
+                    continue;
+                };
+                let alpha = corrected_coverage(
+                    sample,
+                    layer.run_color,
+                    correction.grayscale_enhanced_contrast,
+                    correction.gamma_ratios,
+                ) * layer.run_color.a;
+                let alpha = (alpha.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                let destination_index =
+                    (destination_y as usize * width + destination_x as usize) * 4;
+                let inverse_alpha = 255 - u16::from(alpha);
+                let source_channels = [
+                    (layer.run_color.b.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                    (layer.run_color.g.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                    (layer.run_color.r.clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                ];
+                for channel in 0..3 {
+                    let source = u16::from(source_channels[channel]) * u16::from(alpha);
+                    let destination =
+                        u16::from(rasterized[destination_index + channel]) * inverse_alpha;
+                    rasterized[destination_index + channel] =
+                        ((source + destination + 127) / 255) as u8;
+                }
+                let destination_alpha = u16::from(rasterized[destination_index + 3]);
+                rasterized[destination_index + 3] = (u16::from(alpha)
+                    + (destination_alpha * inverse_alpha + 127) / 255)
+                    .min(255) as u8;
+            }
+        }
+    }
+
+    for pixel in rasterized.chunks_exact_mut(4) {
+        if pixel[3] == 0 {
+            continue;
+        }
+        let alpha = u16::from(pixel[3]);
+        for channel in &mut pixel[..3] {
+            *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+        }
+    }
+    rasterized
+}
+
+fn corrected_coverage(
+    sample: u8,
+    color: Rgba,
+    enhanced_contrast: f32,
+    gamma_ratios: [f32; 4],
+) -> f32 {
+    let brightness = 0.30 * color.r + 0.59 * color.g + 0.11 * color.b;
+    let contrast = enhanced_contrast * (4.0 * (0.75 - brightness)).clamp(0.0, 1.0);
+    let sample = f32::from(sample) / 255.0;
+    let contrasted = sample * (contrast + 1.0) / (sample * contrast + 1.0);
+    let brightness_adjustment = gamma_ratios[0] * brightness + gamma_ratios[1];
+    let correction =
+        brightness_adjustment * contrasted + (gamma_ratios[2] * brightness + gamma_ratios[3]);
+    contrasted + contrasted * (1.0 - contrasted) * correction
 }
 
 struct GlyphLayerTexture {
@@ -1275,13 +1381,8 @@ struct GlyphLayerTexture {
 }
 
 impl GlyphLayerTexture {
-    fn new(
-        gpu_state: &GPUState,
-        run_color: Rgba,
-        bounds: Bounds<i32>,
-        alpha_data: &[u8],
-    ) -> Result<Self> {
-        let texture_size = bounds.size;
+    fn new(gpu_state: &GPUState, layer: &ColorGlyphLayer) -> Result<Self> {
+        let texture_size = layer.bounds.size;
 
         let desc = D3D11_TEXTURE2D_DESC {
             Width: texture_size.width as u32,
@@ -1323,15 +1424,15 @@ impl GlyphLayerTexture {
                 &texture,
                 0,
                 None,
-                alpha_data.as_ptr() as _,
+                layer.alpha_data.as_ptr() as _,
                 texture_size.width as u32,
                 0,
             )
         };
 
         Ok(GlyphLayerTexture {
-            run_color,
-            bounds,
+            run_color: layer.run_color,
+            bounds: layer.bounds,
             texture_view,
             _texture: texture,
         })
