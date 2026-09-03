@@ -215,6 +215,7 @@ struct BenchmarkReport {
     architecture: String,
     logical_cpu_count: usize,
     requested_renderer: Option<String>,
+    requested_directx_adapter: Option<String>,
     gpu: Option<GpuReport>,
     window: WindowReport,
     warmup_frames: usize,
@@ -470,6 +471,7 @@ impl BenchmarkDriver {
             architecture: env::consts::ARCH.to_owned(),
             logical_cpu_count: thread::available_parallelism().map_or(1, usize::from),
             requested_renderer: env::var("GPUI_RENDERER").ok(),
+            requested_directx_adapter: env::var("GPUI_D3D_ADAPTER").ok(),
             gpu: self.gpu.as_ref().map(|gpu| GpuReport {
                 is_software_emulated: gpu.is_software_emulated,
                 device_name: gpu.device_name.clone(),
@@ -924,16 +926,30 @@ fn compare_windows(options: CompareOptions) -> Result<()> {
             let output = options
                 .output_dir
                 .join(format!("{label}-round-{:02}.json", round + 1));
-            let (executable, renderer, revision) = if label == "baseline" {
+            let (executable, renderer, directx_adapter, revision) = if label == "baseline" {
                 (
                     &baseline_executable,
                     baseline_is_current.then_some("directx"),
+                    Some("warp"),
                     "upstream-or-legacy",
                 )
             } else {
-                (&candidate_executable, Some("software"), "gpui-software")
+                (
+                    &candidate_executable,
+                    Some("software"),
+                    None,
+                    "gpui-software",
+                )
             };
-            run_child(executable, renderer, label, revision, &output, &options.run)?;
+            run_child(
+                executable,
+                renderer,
+                directx_adapter,
+                label,
+                revision,
+                &output,
+                &options.run,
+            )?;
             let report = read_report(&output)?;
             validate_comparison_report(label, &report)?;
         }
@@ -948,6 +964,7 @@ fn compare_windows(options: CompareOptions) -> Result<()> {
 fn run_child(
     executable: &Path,
     renderer: Option<&str>,
+    directx_adapter: Option<&str>,
     label: &str,
     revision: &str,
     output: &Path,
@@ -973,6 +990,11 @@ fn run_child(
         command.env("GPUI_RENDERER", renderer);
     } else {
         command.env_remove("GPUI_RENDERER");
+    }
+    if let Some(directx_adapter) = directx_adapter {
+        command.env("GPUI_D3D_ADAPTER", directx_adapter);
+    } else {
+        command.env_remove("GPUI_D3D_ADAPTER");
     }
     let child = command
         .spawn()
@@ -1012,6 +1034,9 @@ fn validate_comparison_report(label: &str, report: &BenchmarkReport) -> Result<(
         .as_ref()
         .ok_or_else(|| anyhow!("{label} report did not include renderer information"))?;
     match label {
+        "baseline" if report.requested_directx_adapter.as_deref() != Some("warp") => {
+            bail!("baseline did not request the WARP adapter")
+        }
         "baseline" if !gpu.is_software_emulated => bail!(
             "baseline used hardware renderer {:?}; this is not a valid no-GPU comparison",
             gpu.device_name

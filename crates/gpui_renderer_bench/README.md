@@ -22,7 +22,7 @@ On a GPU-less Windows system, compare the two renderers in the same executable:
   --measure-frames 180
 ```
 
-Rounds alternate baseline-first and candidate-first to reduce thermal and ordering bias. The baseline is forced with `GPUI_RENDERER=directx`; the candidate is forced with `GPUI_RENDERER=software`.
+Rounds alternate baseline-first and candidate-first to reduce thermal and ordering bias. The baseline is forced with `GPUI_RENDERER=directx` and `GPUI_D3D_ADAPTER=warp`; the candidate is forced with `GPUI_RENDERER=software`. Selecting WARP explicitly makes the legacy no-GPU path reproducible even when the benchmark host also has a physical GPU.
 
 For the strictest upstream comparison, apply the benchmark-only commit to an unmodified upstream checkout and build one runner from each checkout. Then invoke the candidate runner with both paths:
 
