@@ -125,7 +125,8 @@ mod tests {
     use gpui::{
         AtlasKey, ContentMask, FontId, GlyphId, ImageId, MonochromeSprite, Path, PolychromeSprite,
         Quad, RenderGlyphParams, RenderImageParams, RenderSvgParams, ScaledPixels, Scene,
-        SharedString, SubpixelSprite, TransformationMatrix, bounds, hsla, point, px, size,
+        SharedString, SubpixelSprite, TransformationMatrix, bounds, hsla, linear_color_stop,
+        linear_gradient, point, px, size,
     };
 
     use super::*;
@@ -189,6 +190,34 @@ mod tests {
         assert!(resized.rects.iter().all(|rect| {
             rect.origin.x == DevicePixels(0) && rect.size.width == DevicePixels(192)
         }));
+    }
+
+    #[test]
+    fn renders_descending_gradient_stops_without_hiding_content() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: mask(64.0, 1.0).bounds,
+            content_mask: mask(64.0, 1.0),
+            background: hsla(0.0, 0.0, 1.0, 1.0).into(),
+            ..Default::default()
+        });
+        scene.insert_primitive(Quad {
+            bounds: mask(64.0, 1.0).bounds,
+            content_mask: mask(64.0, 1.0),
+            background: linear_gradient(
+                90.0,
+                linear_color_stop(hsla(0.0, 0.0, 0.0, 1.0), 0.7),
+                linear_color_stop(hsla(0.0, 0.0, 0.0, 0.0), 0.0),
+            ),
+            ..Default::default()
+        });
+        scene.finish();
+
+        let mut renderer = SoftwareRenderer::new(device_size(64, 1), FontCorrection::default());
+        renderer.draw(&scene, false);
+        let pixels = renderer.framebuffer().pixels();
+
+        assert!(pixels[0] > pixels[63]);
     }
 
     #[test]
