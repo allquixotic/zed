@@ -22,9 +22,4 @@ rayon.workspace = true
 vello_cpu = { version = "0.2", default-features = false, features = ["std", "u8_pipeline"] }
 
 [dev-dependencies]
-criterion.workspace = true
 rand.workspace = true
-
-[[bench]]
-name = "frame"
-harness = false
