@@ -561,7 +561,12 @@ fn gradient_affine(background: Background, bounds: Bounds<ScaledPixels>) -> (f32
         height
     };
     let stops = background.colors();
-    let stop_span = (stops[1].percentage - stops[0].percentage).max(f32::EPSILON);
+    let stop_span = stops[1].percentage - stops[0].percentage;
+    let stop_span = if stop_span.abs() < f32::EPSILON {
+        f32::EPSILON.copysign(stop_span)
+    } else {
+        stop_span
+    };
     let dt_dx = direction[0] / length / denominator / stop_span;
     let dt_dy = direction[1] / length / denominator / stop_span;
     let center_x = bounds.origin.x.0 + width * 0.5;
