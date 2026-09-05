@@ -24,7 +24,11 @@ pub(crate) struct BinGrid {
 }
 
 impl BinGrid {
-    pub fn new(size: Size<DevicePixels>, ops: &[Op]) -> Self {
+    pub fn new(
+        size: Size<DevicePixels>,
+        ops: &[Op],
+        atlas: &crate::atlas::SoftwareAtlasState,
+    ) -> Self {
         let width = size.width.0.max(0) as usize;
         let height = size.height.0.max(0) as usize;
         let columns = width.div_ceil(CELL_WIDTH);
@@ -47,7 +51,7 @@ impl BinGrid {
             let last_column = (rect.x1 - 1).max(0) as usize / CELL_WIDTH;
             let first_row = rect.y0.max(0) as usize / BAND_HEIGHT;
             let last_row = (rect.y1 - 1).max(0) as usize / BAND_HEIGHT;
-            let op_hash = op.hash();
+            let op_hash = op.hash(atlas);
             for row in first_row..=last_row.min(rows.saturating_sub(1)) {
                 for column in first_column..=last_column.min(columns.saturating_sub(1)) {
                     let cell_rect = grid.cell_rect(row, column);
@@ -124,6 +128,7 @@ mod tests {
                 height: DevicePixels(32),
             },
             &ops,
+            &crate::SoftwareAtlas::new().lock(),
         );
         assert_eq!(grid.cell(0, 0).opaque_cutoff, Some(1));
     }

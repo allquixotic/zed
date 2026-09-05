@@ -64,7 +64,8 @@ impl SoftwareRenderer {
         let frame_start = std::time::Instant::now();
         let lowered = lower_scene(scene, self.font_correction);
         let lower_elapsed = frame_start.elapsed();
-        let bins = BinGrid::new(self.framebuffer.size(), &lowered.ops);
+        let atlas = self.atlas.lock();
+        let bins = BinGrid::new(self.framebuffer.size(), &lowered.ops, &atlas);
         let bin_elapsed = frame_start.elapsed() - lower_elapsed;
         let force_full = force_full
             || self.force_full
@@ -79,7 +80,6 @@ impl SoftwareRenderer {
 
         let raster_start = std::time::Instant::now();
         if !damage.rects.is_empty() {
-            let atlas = self.atlas.lock();
             raster::rasterize(&mut self.framebuffer, &lowered, &bins, &damage, &atlas);
         }
         let raster_elapsed = raster_start.elapsed();
@@ -356,5 +356,57 @@ mod tests {
                 .iter()
                 .any(|pixel| *pixel != 0xff00_0000)
         );
+    }
+    #[test]
+    fn atlas_reuse_invalidates_damage() {
+        let mut renderer = SoftwareRenderer::new(device_size(8, 1), FontCorrection::default());
+        let atlas = renderer.atlas();
+        for index in 0..260 {
+            let key = AtlasKey::Image(RenderImageParams {
+                image_id: ImageId(index),
+                frame_index: 0,
+            });
+            let bytes = if index % 2 == 0 {
+                [0u8, 0, 255, 255].repeat(8)
+            } else {
+                [255u8, 0, 0, 255].repeat(8)
+            };
+            let tile = atlas
+                .get_or_insert_with(&key, &mut || {
+                    Ok(Some((device_size(8, 1), Cow::Borrowed(&bytes))))
+                })
+                .expect("insert")
+                .expect("tile");
+            let mut scene = Scene::default();
+            scene.insert_primitive(PolychromeSprite {
+                order: 0,
+                pad: 0,
+                grayscale: false.into(),
+                opacity: 1.0,
+                bounds: mask(8.0, 1.0).bounds,
+                content_mask: mask(8.0, 1.0),
+                corner_radii: Default::default(),
+                tile,
+            });
+            scene.finish();
+            assert!(
+                !renderer.draw(&scene, false).is_empty(),
+                "replacement {index}"
+            );
+            let expected = if index % 2 == 0 {
+                0xffff_0000
+            } else {
+                0xff00_00ff
+            };
+            assert!(
+                renderer
+                    .framebuffer()
+                    .pixels()
+                    .iter()
+                    .all(|pixel| *pixel == expected)
+            );
+            assert!(renderer.draw(&scene, false).is_empty());
+            atlas.remove(&key);
+        }
     }
 }

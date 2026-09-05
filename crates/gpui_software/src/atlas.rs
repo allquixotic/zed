@@ -15,6 +15,7 @@ pub(crate) struct SoftwareAtlasState {
     polychrome_textures: AtlasTextureList<SoftwareAtlasTexture>,
     subpixel_textures: AtlasTextureList<SoftwareAtlasTexture>,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    next_generation: u64,
 }
 
 pub(crate) struct SoftwareAtlasTexture {
@@ -24,6 +25,7 @@ pub(crate) struct SoftwareAtlasTexture {
     allocator: BucketedAtlasAllocator,
     pixels: Vec<u8>,
     live_atlas_keys: u32,
+    generation: u64,
 }
 
 impl SoftwareAtlas {
@@ -33,6 +35,7 @@ impl SoftwareAtlas {
             polychrome_textures: Default::default(),
             subpixel_textures: Default::default(),
             tiles_by_key: Default::default(),
+            next_generation: 1,
         }))
     }
 
@@ -89,6 +92,8 @@ impl PlatformAtlas for SoftwareAtlas {
 
 impl SoftwareAtlasState {
     fn deallocate(&mut self, tile: AtlasTile) {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
         let textures = self.textures_mut(tile.texture_id.kind);
         let Some(texture_slot) = textures.textures.get_mut(tile.texture_id.index as usize) else {
             return;
@@ -96,6 +101,7 @@ impl SoftwareAtlasState {
         let Some(mut texture) = texture_slot.take() else {
             return;
         };
+        texture.generation = generation;
         texture.allocator.deallocate(tile.tile_id.into());
         texture.live_atlas_keys = texture.live_atlas_keys.saturating_sub(1);
         if texture.live_atlas_keys == 0 {
@@ -153,6 +159,8 @@ impl SoftwareAtlasState {
             AtlasTextureKind::Monochrome => 1,
             AtlasTextureKind::Polychrome | AtlasTextureKind::Subpixel => 4,
         };
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
         let textures = self.textures_mut(kind);
         let index = textures.free_list.pop();
         let id = AtlasTextureId {
@@ -166,6 +174,7 @@ impl SoftwareAtlasState {
             allocator: BucketedAtlasAllocator::new(device_size_to_etagere(size)),
             pixels: vec![0; size.width.0 as usize * size.height.0 as usize * bytes_per_pixel],
             live_atlas_keys: 0,
+            generation,
         };
         if let Some(index) = index {
             textures.textures[index] = Some(texture);
@@ -181,6 +190,10 @@ impl SoftwareAtlasState {
             .textures
             .get_mut(id.index as usize)?
             .as_mut()
+    }
+
+    pub(crate) fn texture_generation(&self, id: AtlasTextureId) -> Option<u64> {
+        self.texture(id).map(|texture| texture.generation)
     }
 
     pub(crate) fn texture_for_tile(

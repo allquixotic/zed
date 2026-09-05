@@ -110,7 +110,7 @@ impl Op {
         matches!(self, Self::FillOpaque { .. })
     }
 
-    pub fn hash(&self) -> u64 {
+    pub fn hash(&self, atlas: &crate::atlas::SoftwareAtlasState) -> u64 {
         let mut hasher = collections::FxHasher::default();
         std::mem::discriminant(self).hash(&mut hasher);
         let rect = self.rect();
@@ -152,6 +152,7 @@ impl Op {
                 hash_rect(*destination, &mut hasher);
                 hash_rect(*untransformed, &mut hasher);
                 hash_tile(*tile, &mut hasher);
+                atlas.texture_generation(tile.texture_id).hash(&mut hasher);
                 color.hash(&mut hasher);
                 if let Some(inverse) = inverse {
                     for value in inverse {
@@ -168,6 +169,7 @@ impl Op {
             } => {
                 hash_rect(*destination, &mut hasher);
                 hash_tile(*tile, &mut hasher);
+                atlas.texture_generation(tile.texture_id).hash(&mut hasher);
                 opacity.hash(&mut hasher);
                 grayscale.hash(&mut hasher);
             }
