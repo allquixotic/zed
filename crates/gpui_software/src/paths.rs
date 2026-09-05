@@ -202,11 +202,10 @@ mod tests {
                         + f64::from(background) * (1.0 - f64::from(alpha) / 255.0))
                         .round() as u32;
                     assert_eq!(actual, expected);
-                    let straight = if alpha == 0 {
-                        0
-                    } else {
-                        ((channel * 255 + alpha / 2) / alpha).min(255)
-                    };
+                    let straight = (channel * 255 + alpha / 2)
+                        .checked_div(alpha)
+                        .unwrap_or(0)
+                        .min(255);
                     let previous = kernels::blend_pixel(background, straight, alpha as u8) & 255;
                     assert!(
                         actual.abs_diff(previous) <= 2,
