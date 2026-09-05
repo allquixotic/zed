@@ -394,6 +394,11 @@ impl WindowsPlatform {
         let all_windows = Arc::downgrade(&self.raw_window_handles);
         let text_system = Arc::downgrade(direct_write_text_system);
         let invalidate_devices = self.invalidate_devices.clone();
+        let redraw_flags = if self.renderer_kind == RendererKind::Software {
+            RDW_INTERNALPAINT
+        } else {
+            RDW_INVALIDATE
+        };
 
         std::thread::Builder::new()
             .name("VSyncProvider".to_owned())
@@ -421,7 +426,9 @@ impl WindowsPlatform {
                     };
                     for hwnd in all_windows.read().iter() {
                         unsafe {
-                            let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                            RedrawWindow(Some(hwnd.as_raw()), None, None, redraw_flags)
+                                .ok()
+                                .log_err();
                         }
                     }
                 }

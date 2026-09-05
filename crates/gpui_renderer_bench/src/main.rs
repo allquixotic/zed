@@ -660,7 +660,9 @@ fn schedule_benchmark_frame(
             }
             Ok(DriverAction::Finish) => {
                 gpui::profiler::set_trace_enabled(false);
-                cx.quit();
+                if !env::var("GPUI_BENCHMARK_HOLD_AFTER_REPORT").is_ok_and(|value| value == "1") {
+                    cx.quit();
+                }
             }
             Err(error) => {
                 let output_error = driver.borrow().output_error.clone();

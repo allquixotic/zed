@@ -68,8 +68,18 @@ impl WindowsRenderer {
     }
 
     pub(crate) fn mark_drawable(&mut self) {
-        if let Self::DirectX(renderer) = self {
-            renderer.mark_drawable();
+        match self {
+            Self::DirectX(renderer) => renderer.mark_drawable(),
+            Self::Software(renderer) => renderer.force_presentation = true,
+        }
+    }
+
+    pub(crate) fn requires_presentation(&self) -> bool {
+        match self {
+            Self::DirectX(_) => false,
+            Self::Software(renderer) => {
+                renderer.force_presentation || renderer.update_rect().is_some()
+            }
         }
     }
 
@@ -93,6 +103,7 @@ impl WindowsRenderer {
 pub(crate) struct SoftwareWindowRenderer {
     hwnd: HWND,
     renderer: SoftwareRenderer,
+    force_presentation: bool,
 }
 
 impl SoftwareWindowRenderer {
@@ -104,14 +115,26 @@ impl SoftwareWindowRenderer {
         Self {
             hwnd,
             renderer: SoftwareRenderer::new(size, font_correction),
+            force_presentation: true,
         }
     }
 
     fn draw(&mut self, scene: &Scene) -> Result<()> {
         let mut damage = self.renderer.draw(scene, false);
-        self.include_update_rect(&mut damage);
+        let exposure = if self.force_presentation {
+            Some(Bounds::new(
+                Default::default(),
+                self.renderer.framebuffer().size(),
+            ))
+        } else {
+            self.update_rect()
+        };
+        if let Some(exposure) = exposure {
+            include_exposure(&mut damage.rects, exposure);
+        }
         let present_start = Instant::now();
         let result = self.present(&damage);
+        self.force_presentation = result.is_err();
         if software_stats_enabled() {
             log::info!(
                 "gpui_software: present={:?} damage_rects={}",
@@ -132,6 +155,7 @@ impl SoftwareWindowRenderer {
 
     fn resize(&mut self, size: Size<DevicePixels>) {
         self.renderer.resize(size);
+        self.force_presentation = true;
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -154,7 +178,7 @@ impl SoftwareWindowRenderer {
             .context("Failed to build RgbaImage from software framebuffer")
     }
 
-    fn include_update_rect(&self, damage: &mut Damage) {
+    fn update_rect(&self) -> Option<Bounds<DevicePixels>> {
         let mut update = RECT::default();
         if unsafe { GetUpdateRect(self.hwnd, Some(&mut update), false) }.as_bool() {
             let size = self.renderer.framebuffer().size();
@@ -163,18 +187,16 @@ impl SoftwareWindowRenderer {
             update.top = update.top.clamp(0, size.height.0.max(0));
             update.bottom = update.bottom.clamp(0, size.height.0.max(0));
         }
-        if update.right > update.left && update.bottom > update.top {
-            damage.rects.push(Bounds {
-                origin: Point {
-                    x: DevicePixels(update.left),
-                    y: DevicePixels(update.top),
-                },
-                size: Size {
-                    width: DevicePixels(update.right - update.left),
-                    height: DevicePixels(update.bottom - update.top),
-                },
-            });
-        }
+        (update.right > update.left && update.bottom > update.top).then_some(Bounds {
+            origin: Point {
+                x: DevicePixels(update.left),
+                y: DevicePixels(update.top),
+            },
+            size: Size {
+                width: DevicePixels(update.right - update.left),
+                height: DevicePixels(update.bottom - update.top),
+            },
+        })
     }
 
     fn present(&self, damage: &Damage) -> Result<()> {
@@ -238,6 +260,56 @@ impl SoftwareWindowRenderer {
                 .context("ReleaseDC failed after presenting a software frame");
         }
         present_result
+    }
+}
+
+fn include_exposure(damage: &mut Vec<Bounds<DevicePixels>>, exposure: Bounds<DevicePixels>) {
+    let covers = |outer: &Bounds<DevicePixels>, inner: &Bounds<DevicePixels>| {
+        outer.origin.x <= inner.origin.x
+            && outer.origin.y <= inner.origin.y
+            && outer.bottom_right().x >= inner.bottom_right().x
+            && outer.bottom_right().y >= inner.bottom_right().y
+    };
+    if damage.iter().any(|rect| covers(rect, &exposure)) {
+        return;
+    }
+    damage.retain(|rect| !covers(&exposure, rect));
+    damage.push(exposure);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposure_repairs_unchanged_pixels_without_duplicate_copies() {
+        let full = Bounds::new(
+            Default::default(),
+            Size {
+                width: DevicePixels(1600),
+                height: DevicePixels(900),
+            },
+        );
+        let caret = Bounds::new(
+            Point {
+                x: DevicePixels(40),
+                y: DevicePixels(20),
+            },
+            Size {
+                width: DevicePixels(2),
+                height: DevicePixels(16),
+            },
+        );
+        let mut damage = vec![caret];
+        include_exposure(&mut damage, full);
+        assert_eq!(damage, [full]);
+        include_exposure(&mut damage, caret);
+        assert_eq!(damage, [full]);
+        include_exposure(&mut damage, full);
+        assert_eq!(damage, [full]);
+        damage.clear();
+        include_exposure(&mut damage, caret);
+        assert_eq!(damage, [caret]);
     }
 }
 
