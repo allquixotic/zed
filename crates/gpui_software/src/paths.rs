@@ -1,7 +1,9 @@
+use std::{cell::RefCell, sync::OnceLock};
+
 use gpui::{BackgroundTag, Path, ScaledPixels};
 use vello_cpu::{
     Pixmap, RenderContext, Resources,
-    color::{AlphaColor, Srgb},
+    color::{AlphaColor, PremulRgba8, Srgb},
     kurbo::{Affine, BezPath},
 };
 
@@ -10,12 +12,67 @@ use crate::{
     lower::{IRect, gradient_affine, gradient_lut, pack_hsla},
 };
 
+pub(crate) struct PreparedPath<'a> {
+    source: &'a Path<ScaledPixels>,
+    prepared: OnceLock<PathPaint>,
+}
+
+struct PathPaint {
+    bezier: BezPath,
+    color: u32,
+    gradient: Option<([u32; 256], (f32, f32, f32))>,
+}
+
+impl<'a> PreparedPath<'a> {
+    pub fn new(source: &'a Path<ScaledPixels>) -> Self {
+        Self {
+            source,
+            prepared: OnceLock::new(),
+        }
+    }
+
+    fn paint(&self) -> &PathPaint {
+        self.prepared.get_or_init(|| {
+            let gradient = (self.source.color.tag() == BackgroundTag::LinearGradient).then(|| {
+                (
+                    gradient_lut(self.source.color),
+                    gradient_affine(self.source.color, self.source.bounds),
+                )
+            });
+            PathPaint {
+                bezier: to_bezier_path(self.source),
+                color: if gradient.is_some() {
+                    0xffff_ffff
+                } else {
+                    pack_hsla(self.source.color.solid())
+                },
+                gradient,
+            }
+        })
+    }
+}
+
+struct PathScratch {
+    context: RenderContext,
+    resources: Resources,
+    pixmap: Pixmap,
+}
+
+thread_local! {
+    // Each renderer cell is at most 64 by 32 pixels; retain bounded scratch on each worker.
+    static SCRATCH: RefCell<PathScratch> = RefCell::new(PathScratch {
+        context: RenderContext::new(64, 32),
+        resources: Resources::new(),
+        pixmap: Pixmap::new(64, 32),
+    });
+}
+
 pub(crate) fn rasterize_path(
     destination: &mut [u32],
     stride: usize,
     band_y: usize,
     rect: IRect,
-    path: &Path<ScaledPixels>,
+    path: &PreparedPath<'_>,
 ) {
     let Ok(width) = u16::try_from(rect.width()) else {
         return;
@@ -26,71 +83,68 @@ pub(crate) fn rasterize_path(
     if width == 0 || height == 0 {
         return;
     }
-    let bezier = to_bezier_path(path);
-    if bezier.is_empty() {
+    let paint = path.paint();
+    if paint.bezier.is_empty() {
         return;
     }
-    let gradient = (path.color.tag() == BackgroundTag::LinearGradient).then(|| {
-        (
-            gradient_lut(path.color),
-            gradient_affine(path.color, path.bounds),
-        )
-    });
-    let color = if gradient.is_some() {
-        0xffff_ffff
-    } else {
-        pack_hsla(path.color.solid())
-    };
-    let mut context = RenderContext::new(width, height);
-    context.set_transform(Affine::translate((
-        f64::from(-rect.x0),
-        f64::from(-rect.y0),
-    )));
-    context.set_paint(AlphaColor::<Srgb>::from_rgba8(
-        ((color >> 16) & 0xff) as u8,
-        ((color >> 8) & 0xff) as u8,
-        (color & 0xff) as u8,
-        (color >> 24) as u8,
-    ));
-    context.fill_path(&bezier);
-    context.flush();
-    let mut resources = Resources::new();
-    let mut pixmap = Pixmap::new(width, height);
-    context.render(&mut pixmap, &mut resources);
+    SCRATCH.with_borrow_mut(|scratch| {
+        let PathScratch {
+            context,
+            resources,
+            pixmap,
+        } = scratch;
+        context.reset_and_resize(width, height);
+        pixmap.resize(width, height);
+        pixmap.data_mut().fill(PremulRgba8::from_u32(0));
+        let color = paint.color;
+        context.set_transform(Affine::translate((
+            f64::from(-rect.x0),
+            f64::from(-rect.y0),
+        )));
+        context.set_paint(AlphaColor::<Srgb>::from_rgba8(
+            ((color >> 16) & 0xff) as u8,
+            ((color >> 8) & 0xff) as u8,
+            (color & 0xff) as u8,
+            (color >> 24) as u8,
+        ));
+        context.fill_path(&paint.bezier);
+        context.flush();
+        context.render(&mut *pixmap, resources);
 
-    for (source_row, y) in pixmap.data().chunks(width as usize).zip(rect.y0..rect.y1) {
-        let destination_start = (y as usize - band_y) * stride + rect.x0 as usize;
-        let destination_row =
-            &mut destination[destination_start..destination_start + width as usize];
-        for ((destination, source), x) in destination_row
-            .iter_mut()
-            .zip(source_row)
-            .zip(rect.x0..rect.x1)
-        {
-            if source.a == 0 {
-                continue;
-            }
-            if let Some((lut, (t0, dt_dx, dt_dy))) = &gradient {
-                let t = t0 + (x as f32 + 0.5) * dt_dx + (y as f32 + 0.5) * dt_dy;
-                let color = lut[(t.clamp(0.0, 1.0) * 255.0).round() as usize];
-                let alpha = ((color >> 24) * u32::from(source.a) + 127) / 255;
-                *destination = kernels::blend_pixel(*destination, color, alpha as u8);
-                continue;
-            }
-            let straight = if source.a == 255 {
-                (u32::from(source.r) << 16) | (u32::from(source.g) << 8) | u32::from(source.b)
-            } else {
-                let unpremultiply = |channel: u8| {
-                    ((u32::from(channel) * 255 + u32::from(source.a) / 2) / u32::from(source.a))
-                        .min(255)
+        for (source_row, y) in pixmap.data().chunks(width as usize).zip(rect.y0..rect.y1) {
+            let destination_start = (y as usize - band_y) * stride + rect.x0 as usize;
+            let destination_row =
+                &mut destination[destination_start..destination_start + width as usize];
+            for ((destination, source), x) in destination_row
+                .iter_mut()
+                .zip(source_row)
+                .zip(rect.x0..rect.x1)
+            {
+                if source.a == 0 {
+                    continue;
+                }
+                if let Some((lut, (t0, dt_dx, dt_dy))) = &paint.gradient {
+                    let t = t0 + (x as f32 + 0.5) * dt_dx + (y as f32 + 0.5) * dt_dy;
+                    let color = lut[(t.clamp(0.0, 1.0) * 255.0).round() as usize];
+                    let alpha = ((color >> 24) * u32::from(source.a) + 127) / 255;
+                    *destination = kernels::blend_pixel(*destination, color, alpha as u8);
+                    continue;
+                }
+                let straight = if source.a == 255 {
+                    (u32::from(source.r) << 16) | (u32::from(source.g) << 8) | u32::from(source.b)
+                } else {
+                    let unpremultiply = |channel: u8| {
+                        ((u32::from(channel) * 255 + u32::from(source.a) / 2) / u32::from(source.a))
+                            .min(255)
+                    };
+                    (unpremultiply(source.r) << 16)
+                        | (unpremultiply(source.g) << 8)
+                        | unpremultiply(source.b)
                 };
-                (unpremultiply(source.r) << 16)
-                    | (unpremultiply(source.g) << 8)
-                    | unpremultiply(source.b)
-            };
-            *destination = kernels::blend_pixel(*destination, straight, source.a);
+                *destination = kernels::blend_pixel(*destination, straight, source.a);
+            }
         }
-    }
+    });
 }
 
 fn to_bezier_path(path: &Path<ScaledPixels>) -> BezPath {

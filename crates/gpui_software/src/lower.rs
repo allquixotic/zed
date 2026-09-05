@@ -201,15 +201,15 @@ fn hash_tile(tile: AtlasTile, hasher: &mut impl Hasher) {
     .hash(hasher);
 }
 
-pub(crate) struct LoweredFrame {
+pub(crate) struct LoweredFrame<'a> {
     pub ops: Vec<Op>,
     pub gradients: Vec<[u32; 256]>,
     pub mono_luts: Vec<AlphaLut>,
     pub subpixel_luts: Vec<AlphaLut3>,
-    pub paths: Vec<Path<ScaledPixels>>,
+    pub paths: Vec<crate::paths::PreparedPath<'a>>,
 }
 
-pub(crate) fn lower_scene(scene: &Scene, correction: FontCorrection) -> LoweredFrame {
+pub(crate) fn lower_scene(scene: &Scene, correction: FontCorrection) -> LoweredFrame<'_> {
     let mut lowerer = Lowerer {
         ops: Vec::with_capacity(scene.len()),
         gradients: Vec::new(),
@@ -314,14 +314,14 @@ pub(crate) fn lower_scene(scene: &Scene, correction: FontCorrection) -> LoweredF
     }
 }
 
-struct Lowerer {
+struct Lowerer<'a> {
     ops: Vec<Op>,
     gradients: Vec<[u32; 256]>,
     luts: LutCache,
-    paths: Vec<Path<ScaledPixels>>,
+    paths: Vec<crate::paths::PreparedPath<'a>>,
 }
 
-impl Lowerer {
+impl<'a> Lowerer<'a> {
     fn quad(&mut self, quad: &gpui::Quad) {
         let bounds = snapped(quad.bounds);
         let clip = snapped(quad.content_mask.bounds);
@@ -403,7 +403,7 @@ impl Lowerer {
         );
     }
 
-    fn path(&mut self, path: &Path<ScaledPixels>) {
+    fn path(&mut self, path: &'a Path<ScaledPixels>) {
         let rect = IRect {
             x0: path.bounds.origin.x.0.floor() as i32,
             y0: path.bounds.origin.y.0.floor() as i32,
@@ -416,7 +416,7 @@ impl Lowerer {
         }
         let path_index = self.paths.len();
         let content_hash = hash_path(path);
-        self.paths.push(path.clone());
+        self.paths.push(crate::paths::PreparedPath::new(path));
         self.ops.push(Op::Path {
             rect,
             path: path_index,
