@@ -3,7 +3,8 @@ use std::{borrow::Cow, hint::black_box};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use gpui::{
     AtlasKey, AtlasTile, ContentMask, DevicePixels, MonochromeSprite, Path, Quad, RenderSvgParams,
-    ScaledPixels, Scene, SharedString, Size, TransformationMatrix, bounds, hsla, point, px, size,
+    ScaledPixels, Scene, SharedString, Size, TransformationMatrix, bounds, hsla, linear_color_stop,
+    linear_gradient, point, px, size,
 };
 use gpui_software::{FontCorrection, SoftwareRenderer};
 
@@ -216,6 +217,32 @@ fn frame_benchmarks(criterion: &mut Criterion) {
             .any(|pixel| *pixel != 0xff00_0000)
     );
     criterion.bench_function(&format!("large-path/{thread_count}"), |bencher| {
+        bencher.iter(|| black_box(renderer.draw(black_box(&scene), true)));
+    });
+
+    let mut scene = Scene::default();
+    for index in 0..64 {
+        scene.insert_primitive(Quad {
+            bounds: bounds(
+                point(
+                    ScaledPixels((index % 8 * 128) as f32),
+                    ScaledPixels((index / 8 * 96) as f32),
+                ),
+                size(ScaledPixels(128.0), ScaledPixels(96.0)),
+            ),
+            content_mask: content_mask(1024, 768),
+            background: linear_gradient(
+                110.0,
+                linear_color_stop(hsla((index % 4) as f32 * 0.25, 0.6, 0.3, 0.5), 0.0),
+                linear_color_stop(hsla(0.6, 0.8, 0.7, 1.0), 1.0),
+            ),
+            ..Default::default()
+        });
+    }
+    scene.finish();
+    renderer.draw(&scene, true);
+    capture(&renderer, "gradients");
+    criterion.bench_function(&format!("gradients/{thread_count}"), |bencher| {
         bencher.iter(|| black_box(renderer.draw(black_box(&scene), true)));
     });
 }

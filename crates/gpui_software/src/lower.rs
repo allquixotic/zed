@@ -5,7 +5,7 @@ use gpui::{
     PrimitiveBatch, Rgba, ScaledPixels, Scene, TransformationMatrix,
 };
 
-use crate::text_correction::{AlphaLut, AlphaLut3, FontCorrection, LutCache};
+use crate::text_correction::{FontCorrection, LutCache};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct IRect {
@@ -201,19 +201,69 @@ fn hash_tile(tile: AtlasTile, hasher: &mut impl Hasher) {
     .hash(hasher);
 }
 
+#[derive(Default)]
+pub(crate) struct LoweringCache {
+    correction: FontCorrection,
+    pub luts: LutCache,
+    gradient_indices: collections::FxHashMap<[u32; 9], usize>,
+    pub gradients: Vec<[u32; 256]>,
+    gradient_hashes: Vec<u64>,
+}
+
+impl LoweringCache {
+    fn gradient(&mut self, background: Background) -> usize {
+        let colors = background.colors();
+        let mut key = [0; 9];
+        key[0] = background.color_space_value() as u32;
+        for (color, key) in colors.iter().zip(key[1..].chunks_exact_mut(4)) {
+            key.copy_from_slice(&[
+                color.color.h.to_bits(),
+                color.color.s.to_bits(),
+                color.color.l.to_bits(),
+                color.color.a.to_bits(),
+            ]);
+        }
+        if let Some(index) = self.gradient_indices.get(&key) {
+            return *index;
+        }
+        let index = self.gradients.len();
+        let lut = gradient_lut(background);
+        let mut hasher = collections::FxHasher::default();
+        lut.hash(&mut hasher);
+        self.gradient_hashes.push(hasher.finish());
+        self.gradients.push(lut);
+        self.gradient_indices.insert(key, index);
+        index
+    }
+
+    pub fn trim(&mut self) {
+        self.luts.trim();
+        if self.gradients.len() > 256 {
+            self.gradients = Vec::new();
+            self.gradient_hashes = Vec::new();
+            self.gradient_indices = Default::default();
+        }
+    }
+}
+
 pub(crate) struct LoweredFrame<'a> {
     pub ops: Vec<Op>,
-    pub gradients: Vec<[u32; 256]>,
-    pub mono_luts: Vec<AlphaLut>,
-    pub subpixel_luts: Vec<AlphaLut3>,
+    pub cache: LoweringCache,
     pub paths: Vec<crate::paths::PreparedPath<'a>>,
 }
 
-pub(crate) fn lower_scene(scene: &Scene, correction: FontCorrection) -> LoweredFrame<'_> {
+pub(crate) fn lower_scene(
+    scene: &Scene,
+    correction: FontCorrection,
+    mut cache: LoweringCache,
+) -> LoweredFrame<'_> {
+    if cache.correction != correction {
+        cache.luts = LutCache::default();
+        cache.correction = correction;
+    }
     let mut lowerer = Lowerer {
         ops: Vec::with_capacity(scene.len()),
-        gradients: Vec::new(),
-        luts: LutCache::default(),
+        cache,
         paths: Vec::new(),
     };
     for batch in scene.batches() {
@@ -253,7 +303,7 @@ pub(crate) fn lower_scene(scene: &Scene, correction: FontCorrection) -> LoweredF
                         continue;
                     }
                     let color = pack_hsla(sprite.color);
-                    let lut = lowerer.luts.mono(color, correction);
+                    let lut = lowerer.cache.luts.mono(color, correction);
                     lowerer.ops.push(Op::BlitMono {
                         rect,
                         destination,
@@ -274,7 +324,7 @@ pub(crate) fn lower_scene(scene: &Scene, correction: FontCorrection) -> LoweredF
                         continue;
                     }
                     let color = pack_hsla(sprite.color);
-                    let lut = lowerer.luts.subpixel(color, correction);
+                    let lut = lowerer.cache.luts.subpixel(color, correction);
                     lowerer.ops.push(Op::BlitSubpixel {
                         rect,
                         destination,
@@ -307,17 +357,14 @@ pub(crate) fn lower_scene(scene: &Scene, correction: FontCorrection) -> LoweredF
     }
     LoweredFrame {
         ops: lowerer.ops,
-        gradients: lowerer.gradients,
-        mono_luts: lowerer.luts.mono_luts,
-        subpixel_luts: lowerer.luts.subpixel_luts,
+        cache: lowerer.cache,
         paths: lowerer.paths,
     }
 }
 
 struct Lowerer<'a> {
     ops: Vec<Op>,
-    gradients: Vec<[u32; 256]>,
-    luts: LutCache,
+    cache: LoweringCache,
     paths: Vec<crate::paths::PreparedPath<'a>>,
 }
 
@@ -340,14 +387,8 @@ impl<'a> Lowerer<'a> {
             }
             BackgroundTag::LinearGradient => {
                 let (t0, dt_dx, dt_dy) = gradient_affine(quad.background, quad.bounds);
-                let gradient = self.gradients.len();
-                let lut = gradient_lut(quad.background);
-                let content_hash = {
-                    let mut hasher = collections::FxHasher::default();
-                    lut.hash(&mut hasher);
-                    hasher.finish()
-                };
-                self.gradients.push(lut);
+                let gradient = self.cache.gradient(quad.background);
+                let content_hash = self.cache.gradient_hashes[gradient];
                 self.ops.push(Op::FillGradient {
                     rect: clipped_bounds,
                     gradient,
@@ -674,6 +715,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lookup_caches_are_bounded_and_invalidate_font_settings() {
+        let mut cache = LoweringCache::default();
+        for index in 0..300 {
+            let background = gpui::linear_gradient(
+                90.0,
+                gpui::linear_color_stop(hsla(index as f32 / 300.0, 0.6, 0.5, 0.8), 0.0),
+                gpui::linear_color_stop(hsla(0.6, 0.8, 0.7, 1.0), 1.0),
+            );
+            let gradient = cache.gradient(background);
+            assert_eq!(cache.gradients[gradient], gradient_lut(background));
+            assert_eq!(cache.gradient(background), gradient);
+            cache.luts.mono(index, FontCorrection::default());
+            cache.luts.subpixel(index, FontCorrection::default());
+        }
+        cache.trim();
+        assert!(cache.gradients.is_empty());
+        assert!(cache.luts.mono_luts.is_empty());
+        assert!(cache.luts.subpixel_luts.is_empty());
+        cache.luts.mono(0xff808080, FontCorrection::default());
+        let scene = Scene::default();
+        let lowered = lower_scene(
+            &scene,
+            FontCorrection {
+                grayscale_enhanced_contrast: 0.5,
+                ..Default::default()
+            },
+            cache,
+        );
+        assert!(lowered.cache.luts.mono_luts.is_empty());
+    }
+
+    #[test]
     fn lowers_quad_and_underline_to_integer_rectangles() {
         let mut scene = Scene::default();
         let clip = ContentMask {
@@ -708,7 +781,7 @@ mod tests {
         });
         scene.finish();
 
-        let lowered = lower_scene(&scene, FontCorrection::default());
+        let lowered = lower_scene(&scene, FontCorrection::default(), LoweringCache::default());
         assert_eq!(lowered.ops.len(), 6);
         assert_eq!(
             lowered.ops[0].rect(),

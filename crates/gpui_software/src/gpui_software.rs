@@ -19,12 +19,13 @@ pub use framebuffer::Framebuffer;
 pub use text_correction::FontCorrection;
 
 use bin_pass::BinGrid;
-use lower::lower_scene;
+use lower::{LoweringCache, lower_scene};
 
 pub struct SoftwareRenderer {
     framebuffer: Framebuffer,
     atlas: Arc<SoftwareAtlas>,
     font_correction: FontCorrection,
+    lowering_cache: LoweringCache,
     previous_hashes: Vec<u64>,
     previous_grid_size: (usize, usize),
     force_full: bool,
@@ -36,6 +37,7 @@ impl SoftwareRenderer {
             framebuffer: Framebuffer::new(size),
             atlas: Arc::new(SoftwareAtlas::new()),
             font_correction,
+            lowering_cache: LoweringCache::default(),
             previous_hashes: Vec::new(),
             previous_grid_size: (0, 0),
             force_full: true,
@@ -62,7 +64,11 @@ impl SoftwareRenderer {
 
     pub fn draw(&mut self, scene: &Scene, force_full: bool) -> Damage {
         let frame_start = std::time::Instant::now();
-        let lowered = lower_scene(scene, self.font_correction);
+        let lowered = lower_scene(
+            scene,
+            self.font_correction,
+            std::mem::take(&mut self.lowering_cache),
+        );
         let lower_elapsed = frame_start.elapsed();
         let atlas = self.atlas.lock();
         let bins = BinGrid::new(self.framebuffer.size(), &lowered.ops, &atlas);
@@ -97,6 +103,8 @@ impl SoftwareRenderer {
             lowered.ops.len(),
             &damage,
         );
+        self.lowering_cache = lowered.cache;
+        self.lowering_cache.trim();
         damage
     }
 

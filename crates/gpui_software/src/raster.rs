@@ -66,7 +66,7 @@ pub(crate) fn rasterize(
                         stride,
                         band_y,
                         rect,
-                        &frame.gradients[*gradient],
+                        &frame.cache.gradients[*gradient],
                         *t0,
                         *dt_dx,
                         *dt_dy,
@@ -95,7 +95,7 @@ pub(crate) fn rasterize(
                                 (tile.bounds.origin.x.0, tile.bounds.origin.y.0),
                                 (tile.bounds.size.width.0, tile.bounds.size.height.0),
                                 *color,
-                                &frame.mono_luts[*lut],
+                                &frame.cache.luts.mono_luts[*lut],
                             );
                         } else {
                             log::error!(
@@ -128,7 +128,7 @@ pub(crate) fn rasterize(
                                 (tile.bounds.origin.x.0, tile.bounds.origin.y.0),
                                 (tile.bounds.size.width.0, tile.bounds.size.height.0),
                                 *color,
-                                &frame.subpixel_luts[*lut],
+                                &frame.cache.luts.subpixel_luts[*lut],
                                 *is_bgr,
                             );
                         } else {

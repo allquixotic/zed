@@ -34,6 +34,17 @@ pub(crate) struct LutCache {
 }
 
 impl LutCache {
+    pub fn trim(&mut self) {
+        if self.mono_luts.len() > 256 {
+            self.mono = Default::default();
+            self.mono_luts = Vec::new();
+        }
+        if self.subpixel_luts.len() > 256 {
+            self.subpixel = Default::default();
+            self.subpixel_luts = Vec::new();
+        }
+    }
+
     pub fn mono(&mut self, color: u32, correction: FontCorrection) -> usize {
         if let Some(index) = self.mono.get(&color) {
             return *index;
