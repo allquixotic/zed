@@ -436,6 +436,16 @@ fn source_position(
     inverse: Option<[f32; 6]>,
     tile_size: (i32, i32),
 ) -> Option<(i32, i32)> {
+    if inverse.is_none()
+        && destination.width() == tile_size.0
+        && destination.height() == tile_size.1
+    {
+        return (x >= destination.x0
+            && x < destination.x1
+            && y >= destination.y0
+            && y < destination.y1)
+            .then_some((x - destination.x0, y - destination.y0));
+    }
     let point = [x as f32 + 0.5, y as f32 + 0.5];
     let point = if let Some([a, b, c, d, translation_x, translation_y]) = inverse {
         [
@@ -513,6 +523,35 @@ mod tests {
     use crate::atlas::SoftwareAtlas;
 
     use super::*;
+
+    #[test]
+    fn integer_sprite_coordinates_match_general_sampling() {
+        for width in [1, 2, 6, 13, 37, 1025] {
+            for origin in [-10, 0, 3, 1000] {
+                let destination = IRect {
+                    x0: origin,
+                    y0: -3,
+                    x1: origin + width,
+                    y1: 7,
+                };
+                for y in -4..8 {
+                    for x in origin - 1..=origin + width {
+                        assert_eq!(
+                            source_position(x, y, destination, destination, None, (width, 10)),
+                            source_position(
+                                x,
+                                y,
+                                destination,
+                                destination,
+                                Some([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+                                (width, 10)
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn selected_fill_kernels_match_scalar_reference() {
