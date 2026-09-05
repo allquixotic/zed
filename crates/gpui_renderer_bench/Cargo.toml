@@ -26,7 +26,7 @@ libc.workspace = true
 smol.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gpui_platform = { workspace = true, features = ["wayland"] }
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [

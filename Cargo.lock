@@ -158,7 +158,7 @@ dependencies = [
  "buffer_diff",
  "clock",
  "collections",
- "ctor",
+ "ctor 1.0.12",
  "fs",
  "futures 0.3.32",
  "git",
@@ -254,7 +254,7 @@ dependencies = [
  "cloud_llm_client",
  "collections",
  "context_server",
- "ctor",
+ "ctor 1.0.12",
  "db",
  "editor",
  "env_logger 0.11.8",
@@ -1373,7 +1373,7 @@ dependencies = [
  "anyhow",
  "client",
  "clock",
- "ctor",
+ "ctor 1.0.12",
  "db",
  "futures 0.3.32",
  "futures-lite 2.6.1",
@@ -2437,7 +2437,7 @@ name = "buffer_diff"
 version = "0.1.0"
 dependencies = [
  "clock",
- "ctor",
+ "ctor 1.0.12",
  "gpui",
  "imara-diff",
  "language",
@@ -3359,7 +3359,7 @@ dependencies = [
  "collab_ui",
  "collections",
  "command_palette_hooks",
- "ctor",
+ "ctor 1.0.12",
  "dap",
  "dap_adapters",
  "dashmap",
@@ -4513,6 +4513,15 @@ dependencies = [
 
 [[package]]
 name = "ctor"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83cf0d42651b16c6dfe68685716d18480d18a9c39c62d76e8cf3eb6ed5d8bcbf"
+dependencies = [
+ "dtor",
+]
+
+[[package]]
+name = "ctor"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d83cb7e7a873830708d6b02a78cd36a592c6fa14bf267b68725103b85c0d77f"
@@ -5064,7 +5073,7 @@ dependencies = [
  "agent_settings",
  "anyhow",
  "collections",
- "ctor",
+ "ctor 1.0.12",
  "editor",
  "futures-lite 2.6.1",
  "gpui",
@@ -5277,6 +5286,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtor"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edf234dd1594d6dd434a8fb8cada51ddbbc593e40e4a01556a0b31c62da2775b"
+
+[[package]]
 name = "dugong"
 version = "0.8.0-alpha.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5359,7 +5374,7 @@ dependencies = [
  "copilot_ui",
  "credentials_provider",
  "criterion",
- "ctor",
+ "ctor 1.0.12",
  "db",
  "edit_prediction_context",
  "edit_prediction_metrics",
@@ -5578,7 +5593,7 @@ dependencies = [
  "clock",
  "collections",
  "convert_case 0.11.0",
- "ctor",
+ "ctor 1.0.12",
  "dap",
  "db",
  "edit_prediction_types",
@@ -6196,7 +6211,7 @@ dependencies = [
  "cloud_api_types",
  "collections",
  "criterion",
- "ctor",
+ "ctor 1.0.12",
  "dap",
  "extension",
  "fs",
@@ -6406,7 +6421,7 @@ dependencies = [
  "channel",
  "client",
  "collections",
- "ctor",
+ "ctor 1.0.12",
  "editor",
  "file_icons",
  "futures 0.3.32",
@@ -7194,7 +7209,7 @@ dependencies = [
  "client",
  "collections",
  "component",
- "ctor",
+ "ctor 1.0.12",
  "db",
  "editor",
  "file_icons",
@@ -7523,7 +7538,7 @@ dependencies = [
  "collections",
  "core-video",
  "criterion",
- "ctor",
+ "ctor 1.0.12",
  "derive_more",
  "embed-resource",
  "env_logger 0.11.8",
@@ -7642,6 +7657,7 @@ dependencies = [
  "raw-window-handle",
  "smallvec",
  "smol",
+ "softbuffer",
  "strum 0.28.0",
  "tempfile",
  "url",
@@ -7675,7 +7691,7 @@ dependencies = [
  "core-foundation-sys",
  "core-graphics 0.24.0",
  "core-text",
- "ctor",
+ "ctor 1.0.12",
  "dispatch2",
  "foreign-types 0.5.0",
  "futures 0.3.32",
@@ -9560,7 +9576,7 @@ dependencies = [
  "clock",
  "collections",
  "criterion",
- "ctor",
+ "ctor 1.0.12",
  "diffy",
  "ec4rs",
  "encoding_rs",
@@ -10463,7 +10479,7 @@ dependencies = [
  "async-channel 2.5.0",
  "async-pipe",
  "collections",
- "ctor",
+ "ctor 1.0.12",
  "futures 0.3.32",
  "futures-lite 2.6.1",
  "gpui",
@@ -11220,7 +11236,7 @@ dependencies = [
  "buffer_diff",
  "clock",
  "collections",
- "ctor",
+ "ctor 1.0.12",
  "futures-lite 2.6.1",
  "gpui",
  "indoc",
@@ -11331,6 +11347,7 @@ dependencies = [
  "log",
  "ndk-sys",
  "num_enum",
+ "raw-window-handle",
  "thiserror 1.0.69",
 ]
 
@@ -11931,6 +11948,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-core-graphics"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
+dependencies = [
+ "bitflags 2.13.1",
+ "dispatch2",
+ "objc2 0.6.3",
+ "objc2-core-foundation",
+ "objc2-io-surface",
+]
+
+[[package]]
 name = "objc2-core-image"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12000,6 +12030,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
 dependencies = [
  "libc",
+ "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-io-surface"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "180788110936d59bab6bd83b6060ffdfffb3b922ba1396b312ae795e1de9d81d"
+dependencies = [
+ "bitflags 2.13.1",
+ "objc2 0.6.3",
  "objc2-core-foundation",
 ]
 
@@ -15483,7 +15524,7 @@ name = "rope"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "ctor",
+ "ctor 1.0.12",
  "gpui",
  "heapless",
  "log",
@@ -17159,6 +17200,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "softbuffer"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aac18da81ebbf05109ab275b157c22a653bb3c12cf884450179942f81bcbf6c3"
+dependencies = [
+ "as-raw-xcb-connection",
+ "bytemuck",
+ "fastrand 2.3.0",
+ "js-sys",
+ "ndk",
+ "objc2 0.6.3",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-foundation 0.3.2",
+ "objc2-quartz-core 0.3.2",
+ "raw-window-handle",
+ "redox_syscall 0.5.18",
+ "rustix",
+ "tiny-xlib",
+ "tracing",
+ "wasm-bindgen",
+ "web-sys",
+ "windows-sys 0.61.2",
+ "x11rb",
+]
+
+[[package]]
 name = "spdx"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -17623,7 +17691,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 name = "sum_tree"
 version = "0.1.0"
 dependencies = [
- "ctor",
+ "ctor 1.0.12",
  "heapless",
  "log",
  "proptest",
@@ -18088,7 +18156,7 @@ name = "tab_switcher"
 version = "0.1.0"
 dependencies = [
  "collections",
- "ctor",
+ "ctor 1.0.12",
  "editor",
  "fuzzy_nucleo",
  "gpui",
@@ -18376,7 +18444,7 @@ dependencies = [
  "anyhow",
  "clock",
  "collections",
- "ctor",
+ "ctor 1.0.12",
  "gpui",
  "log",
  "parking_lot",
@@ -18625,6 +18693,19 @@ dependencies = [
  "arrayref",
  "bytemuck",
  "strict-num",
+]
+
+[[package]]
+name = "tiny-xlib"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a90a0ca3ee6a69f2ad28fd11621a4c3f03b371f366be500b64df260c4ffbafb4"
+dependencies = [
+ "as-raw-xcb-connection",
+ "ctor 0.10.1",
+ "libloading",
+ "pkg-config",
+ "tracing",
 ]
 
 [[package]]
@@ -20698,7 +20779,7 @@ dependencies = [
 name = "watch"
 version = "0.1.0"
 dependencies = [
- "ctor",
+ "ctor 1.0.12",
  "futures 0.3.32",
  "gpui",
  "parking_lot",
@@ -22530,6 +22611,8 @@ dependencies = [
  "as-raw-xcb-connection",
  "gethostname",
  "libc",
+ "libloading",
+ "once_cell",
  "rustix",
  "x11rb-protocol",
  "xcursor",

@@ -35,6 +35,9 @@ wayland = [
     "gpui/wayland",
 ]
 x11 = [
+    "gpui/x11",
+    "gpui_software",
+    "softbuffer",
     "gpui_wgpu",
     "ashpd",
 
@@ -69,6 +72,7 @@ libc.workspace = true
 log.workspace = true
 memmap2 = { workspace = true, optional = true }
 parking_lot.workspace = true
+softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen"], optional = true }
 smallvec.workspace = true
 smol.workspace = true
 strum.workspace = true
