@@ -1,3 +1,4 @@
+use gpui::AtlasTextureKind;
 use rayon::prelude::*;
 
 use crate::{
@@ -78,7 +79,7 @@ pub(crate) fn rasterize(
                             inverse,
                             ..
                         } => {
-                            if let Some(texture) = atlas.texture(tile.texture_id) {
+                            if let Some(texture) = atlas.texture_for_tile(*tile, AtlasTextureKind::Monochrome) {
                                 kernels::blit_mono(
                                     pixels,
                                     stride,
@@ -94,7 +95,7 @@ pub(crate) fn rasterize(
                                     &frame.mono_luts[*lut],
                                 );
                             } else {
-                                log::error!("software renderer referenced a retired monochrome atlas texture");
+                                log::error!("software renderer referenced an invalid or retired monochrome atlas texture");
                             }
                         }
                         Op::BlitSubpixel {
@@ -107,7 +108,7 @@ pub(crate) fn rasterize(
                             is_bgr,
                             ..
                         } => {
-                            if let Some(texture) = atlas.texture(tile.texture_id) {
+                            if let Some(texture) = atlas.texture_for_tile(*tile, AtlasTextureKind::Subpixel) {
                                 kernels::blit_subpixel(
                                     pixels,
                                     stride,
@@ -124,7 +125,7 @@ pub(crate) fn rasterize(
                                     *is_bgr,
                                 );
                             } else {
-                                log::error!("software renderer referenced a retired subpixel atlas texture");
+                                log::error!("software renderer referenced an invalid or retired subpixel atlas texture");
                             }
                         }
                         Op::BlitPolychrome {
@@ -134,7 +135,7 @@ pub(crate) fn rasterize(
                             grayscale,
                             ..
                         } => {
-                            if let Some(texture) = atlas.texture(tile.texture_id) {
+                            if let Some(texture) = atlas.texture_for_tile(*tile, AtlasTextureKind::Polychrome) {
                                 kernels::blit_polychrome(
                                     pixels,
                                     stride,
@@ -148,7 +149,7 @@ pub(crate) fn rasterize(
                                     *grayscale,
                                 );
                             } else {
-                                log::error!("software renderer referenced a retired polychrome atlas texture");
+                                log::error!("software renderer referenced an invalid or retired polychrome atlas texture");
                             }
                         }
                         Op::Path { path, .. } => paths::rasterize_path(

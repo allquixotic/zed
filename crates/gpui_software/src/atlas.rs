@@ -183,6 +183,28 @@ impl SoftwareAtlasState {
             .as_mut()
     }
 
+    pub(crate) fn texture_for_tile(
+        &self,
+        tile: AtlasTile,
+        kind: AtlasTextureKind,
+    ) -> Option<&SoftwareAtlasTexture> {
+        if tile.texture_id.kind != kind {
+            return None;
+        }
+        let texture = self.texture(tile.texture_id)?;
+        let origin = tile.bounds.origin;
+        let size = tile.bounds.size;
+        if origin.x.0 < 0 || origin.y.0 < 0 || size.width.0 <= 0 || size.height.0 <= 0 {
+            return None;
+        }
+        if origin.x.0.checked_add(size.width.0)? > texture.size.width.0
+            || origin.y.0.checked_add(size.height.0)? > texture.size.height.0
+        {
+            return None;
+        }
+        Some(texture)
+    }
+
     pub(crate) fn texture(&self, id: AtlasTextureId) -> Option<&SoftwareAtlasTexture> {
         self.textures(id.kind)
             .textures
@@ -294,5 +316,54 @@ mod tests {
             .expect("atlas insertion failed")
             .expect("builder returned a tile");
         assert_eq!(first.texture_id, second.texture_id);
+    }
+    #[test]
+    fn rejects_invalid_atlas_tiles() {
+        let atlas = SoftwareAtlas::new();
+        let size = Size {
+            width: DevicePixels(8),
+            height: DevicePixels(2),
+        };
+        let tile = atlas
+            .get_or_insert_with(&image_key(1), &mut || {
+                Ok(Some((size, Cow::Borrowed(&[255; 64]))))
+            })
+            .expect("insert")
+            .expect("tile");
+        let state = atlas.lock();
+        assert!(
+            state
+                .texture_for_tile(tile, AtlasTextureKind::Polychrome)
+                .is_some()
+        );
+        assert!(
+            state
+                .texture_for_tile(tile, AtlasTextureKind::Monochrome)
+                .is_none()
+        );
+        for (x, y, width, height) in [
+            (-1, 0, 8, 2),
+            (0, -1, 8, 2),
+            (0, 0, 0, 2),
+            (0, 0, 8, -1),
+            (1020, 0, 8, 2),
+            (0, 1023, 8, 2),
+            (i32::MAX, 0, 8, 2),
+            (0, i32::MAX, 8, 2),
+        ] {
+            let mut invalid = tile;
+            invalid.bounds = Bounds::new(
+                Point::new(DevicePixels(x), DevicePixels(y)),
+                Size {
+                    width: DevicePixels(width),
+                    height: DevicePixels(height),
+                },
+            );
+            assert!(
+                state
+                    .texture_for_tile(invalid, AtlasTextureKind::Polychrome)
+                    .is_none()
+            );
+        }
     }
 }
