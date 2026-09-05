@@ -135,6 +135,8 @@ fn frame_benchmarks(criterion: &mut Criterion) {
             .map(|variant| glyph_tile(&renderer, variant))
             .collect::<Vec<_>>();
         let scene = editor_scene(window_size, &tiles, false, 0);
+        renderer.draw(&scene, true);
+        capture(&renderer, &format!("editor-{name}"));
         criterion.bench_with_input(
             BenchmarkId::new(format!("full-{name}"), thread_count),
             &thread_count,
@@ -205,6 +207,7 @@ fn frame_benchmarks(criterion: &mut Criterion) {
     scene.insert_primitive(path.scale(1.0));
     scene.finish();
     renderer.draw(&scene, true);
+    capture(&renderer, "large-path");
     assert!(
         renderer
             .framebuffer()
@@ -215,6 +218,20 @@ fn frame_benchmarks(criterion: &mut Criterion) {
     criterion.bench_function(&format!("large-path/{thread_count}"), |bencher| {
         bencher.iter(|| black_box(renderer.draw(black_box(&scene), true)));
     });
+}
+
+fn capture(renderer: &SoftwareRenderer, name: &str) {
+    if let Some(directory) = std::env::var_os("GPUI_SOFTWARE_CAPTURE_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).expect("create capture directory");
+        let bytes: Vec<_> = renderer
+            .framebuffer()
+            .pixels()
+            .iter()
+            .flat_map(|pixel| pixel.to_le_bytes())
+            .collect();
+        std::fs::write(directory.join(format!("{name}.argb")), bytes).expect("write frame capture");
+    }
 }
 
 fn validate_pair(renderer: &mut SoftwareRenderer, base: &Scene, changed: &Scene, scrolling: bool) {

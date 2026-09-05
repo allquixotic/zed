@@ -532,4 +532,63 @@ mod tests {
                 .all(|pixel| *pixel == 0xff00_0000)
         );
     }
+
+    #[test]
+    fn incremental_frames_match_full_across_scene_changes() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut random = StdRng::seed_from_u64(0x5ced_2026);
+        let mut renderer = SoftwareRenderer::new(device_size(193, 97), FontCorrection::default());
+        for frame in 0..100 {
+            if frame % 13 == 0 {
+                renderer.resize(device_size(
+                    random.random_range(65..260),
+                    random.random_range(33..130),
+                ));
+            }
+            let mut scene = Scene::default();
+            for index in 0..35 {
+                let color = hsla(random.random(), 0.7, 0.6, random.random());
+                let background = if index % 3 == 0 {
+                    linear_gradient(
+                        random.random_range(-360.0..360.0),
+                        linear_color_stop(color, 0.0),
+                        linear_color_stop(hsla(0.5, 0.6, 0.4, 0.8), 1.0),
+                    )
+                } else {
+                    color.into()
+                };
+                scene.insert_primitive(Quad {
+                    bounds: bounds(
+                        point(
+                            ScaledPixels(random.random_range(-20.0..200.0)),
+                            ScaledPixels(random.random_range(-10.0..100.0)),
+                        ),
+                        size(
+                            ScaledPixels(random.random_range(0.0..100.0)),
+                            ScaledPixels(random.random_range(0.0..60.0)),
+                        ),
+                    ),
+                    content_mask: mask(220.0, 120.0),
+                    background,
+                    ..Default::default()
+                });
+            }
+            let mut path = rectangle_path(
+                random.random_range(0.0..2.0),
+                random.random_range(3.0..15.0),
+            );
+            path.color = hsla(random.random(), 0.7, 0.5, random.random()).into();
+            scene.insert_primitive(path);
+            scene.finish();
+            renderer.draw(&scene, false);
+            let incremental = renderer.framebuffer().pixels().to_vec();
+            renderer.draw(&scene, true);
+            assert_eq!(
+                incremental,
+                renderer.framebuffer().pixels(),
+                "frame {frame}"
+            );
+            assert!(renderer.draw(&scene, false).is_empty());
+        }
+    }
 }
