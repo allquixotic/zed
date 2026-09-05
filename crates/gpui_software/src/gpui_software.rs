@@ -509,6 +509,31 @@ mod tests {
     }
 
     #[test]
+    fn fractional_gradient_path_bounds_invalidate_damage() {
+        let mut path = rectangle_path(1.0, 9.0);
+        path.color = linear_gradient(
+            90.0,
+            linear_color_stop(hsla(0.0, 0.0, 0.0, 1.0), 0.0),
+            linear_color_stop(hsla(0.0, 0.0, 1.0, 1.0), 1.0),
+        );
+        let mut first = Scene::default();
+        first.insert_primitive(path.clone());
+        first.finish();
+        path.bounds.size.width.0 -= 0.25;
+        let mut second = Scene::default();
+        second.insert_primitive(path);
+        second.finish();
+        let mut renderer = SoftwareRenderer::new(device_size(16, 16), FontCorrection::default());
+        renderer.draw(&first, true);
+        let original = renderer.framebuffer().pixels().to_vec();
+        renderer.draw(&second, false);
+        let incremental = renderer.framebuffer().pixels().to_vec();
+        renderer.draw(&second, true);
+        assert_ne!(original, renderer.framebuffer().pixels());
+        assert_eq!(incremental, renderer.framebuffer().pixels());
+    }
+
+    #[test]
     fn singular_sprites_are_empty() {
         let mut renderer = SoftwareRenderer::new(device_size(16, 16), FontCorrection::default());
         let tile = renderer

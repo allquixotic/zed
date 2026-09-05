@@ -478,6 +478,14 @@ impl<'a> Lowerer<'a> {
 
 fn hash_path(path: &Path<ScaledPixels>) -> u64 {
     let mut hasher = collections::FxHasher::default();
+    for component in [
+        path.bounds.origin.x.0,
+        path.bounds.origin.y.0,
+        path.bounds.size.width.0,
+        path.bounds.size.height.0,
+    ] {
+        component.to_bits().hash(&mut hasher);
+    }
     (path.color.tag() as u32).hash(&mut hasher);
     (path.color.color_space_value() as u32).hash(&mut hasher);
     path.color.solid().h.to_bits().hash(&mut hasher);
