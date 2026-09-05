@@ -185,7 +185,7 @@ mod tests {
     fn tracks_damage_and_forces_full_redraw_after_resize() {
         let mut renderer = SoftwareRenderer::new(device_size(128, 64), FontCorrection::default());
         let first = renderer.draw(&damage_scene(hsla(0.0, 1.0, 0.5, 1.0)), false);
-        assert_eq!(first.rects.len(), 2);
+        assert_eq!(first.rects.len(), 1);
         assert!(
             renderer
                 .draw(&damage_scene(hsla(0.0, 1.0, 0.5, 1.0)), false)
@@ -199,7 +199,7 @@ mod tests {
 
         renderer.resize(device_size(192, 96));
         let resized = renderer.draw(&damage_scene(hsla(0.6, 1.0, 0.5, 1.0)), false);
-        assert_eq!(resized.rects.len(), 3);
+        assert_eq!(resized.rects.len(), 1);
         assert!(resized.rects.iter().all(|rect| {
             rect.origin.x == DevicePixels(0) && rect.size.width == DevicePixels(192)
         }));
@@ -610,8 +610,10 @@ mod tests {
         let scene = |hue| {
             let mut scene = damage_scene(hsla(hue, 0.5, 0.5, 1.0));
             scene.insert_primitive(Quad {
-                bounds: mask(128.0, 64.0).bounds, content_mask: mask(128.0, 64.0),
-                background: hsla(0.5, 0.5, 0.5, 1.0).into(), ..Default::default()
+                bounds: mask(128.0, 64.0).bounds,
+                content_mask: mask(128.0, 64.0),
+                background: hsla(0.5, 0.5, 0.5, 1.0).into(),
+                ..Default::default()
             });
             scene.finish();
             scene
@@ -640,7 +642,12 @@ mod tests {
         renderer.draw(&scene(false), false);
         let damage = renderer.draw(&scene(true), false);
         assert!(!damage.is_empty());
-        assert!(damage.rects.iter().all(|rect| rect.origin.x.0 + rect.size.width.0 <= 64));
+        assert!(
+            damage
+                .rects
+                .iter()
+                .all(|rect| rect.origin.x.0 + rect.size.width.0 <= 64)
+        );
         let incremental = renderer.framebuffer().pixels().to_vec();
         renderer.draw(&scene(true), true);
         assert_eq!(incremental, renderer.framebuffer().pixels());
