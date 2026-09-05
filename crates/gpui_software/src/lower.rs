@@ -360,10 +360,11 @@ impl Lowerer {
         }
 
         let border_color = pack_hsla(quad.border_color);
-        let top = quad.border_widths.top.0.round().max(0.0) as i32;
-        let right = quad.border_widths.right.0.round().max(0.0) as i32;
-        let bottom = quad.border_widths.bottom.0.round().max(0.0) as i32;
-        let left = quad.border_widths.left.0.round().max(0.0) as i32;
+        let top = (quad.border_widths.top.0.round().max(0.0) as i32).min(bounds.height());
+        let bottom =
+            (quad.border_widths.bottom.0.round().max(0.0) as i32).min(bounds.height() - top);
+        let left = (quad.border_widths.left.0.round().max(0.0) as i32).min(bounds.width());
+        let right = (quad.border_widths.right.0.round().max(0.0) as i32).min(bounds.width() - left);
         self.fill(
             IRect {
                 y1: bounds.y0 + top,
@@ -403,7 +404,13 @@ impl Lowerer {
     }
 
     fn path(&mut self, path: &Path<ScaledPixels>) {
-        let rect = snapped(path.bounds).intersect(snapped(path.content_mask.bounds));
+        let rect = IRect {
+            x0: path.bounds.origin.x.0.floor() as i32,
+            y0: path.bounds.origin.y.0.floor() as i32,
+            x1: path.bounds.bottom_right().x.0.ceil() as i32,
+            y1: path.bounds.bottom_right().y.0.ceil() as i32,
+        }
+        .intersect(snapped(path.content_mask.bounds));
         if rect.is_empty() {
             return;
         }
@@ -510,9 +517,10 @@ fn transformed_bounds(
         .fold(f32::NEG_INFINITY, f32::max);
     let matrix = transformation.rotation_scale;
     let determinant = matrix[0][0] * matrix[1][1] - matrix[0][1] * matrix[1][0];
-    let inverse = if determinant.abs() <= f32::EPSILON {
-        None
-    } else {
+    if determinant == 0.0 || !determinant.is_finite() {
+        return (IRect::default(), None);
+    }
+    let inverse = {
         let a = matrix[1][1] / determinant;
         let b = -matrix[0][1] / determinant;
         let c = -matrix[1][0] / determinant;
@@ -546,7 +554,10 @@ pub(crate) fn pack_rgba(color: Rgba) -> u32 {
     (channel(color.a) << 24) | (channel(color.r) << 16) | (channel(color.g) << 8) | channel(color.b)
 }
 
-fn gradient_affine(background: Background, bounds: Bounds<ScaledPixels>) -> (f32, f32, f32) {
+pub(crate) fn gradient_affine(
+    background: Background,
+    bounds: Bounds<ScaledPixels>,
+) -> (f32, f32, f32) {
     let angle = (background.gradient_angle_or_pattern_height() % 360.0 - 90.0).to_radians();
     let mut direction = [angle.cos(), angle.sin()];
     let width = bounds.size.width.0.max(f32::EPSILON);
@@ -573,19 +584,12 @@ fn gradient_affine(background: Background, bounds: Bounds<ScaledPixels>) -> (f32
     let dt_dy = direction[1] / length / denominator / stop_span;
     let center_x = bounds.origin.x.0 + width * 0.5;
     let center_y = bounds.origin.y.0 + height * 0.5;
-    let axis_offset = if direction[0].abs() > direction[1].abs() {
-        0.5
-    } else {
-        0.5
-    };
-    let t0 = axis_offset
-        - stops[0].percentage
-        - center_x * dt_dx * stop_span
-        - center_y * dt_dy * stop_span;
+    let t0 =
+        0.5 - stops[0].percentage - center_x * dt_dx * stop_span - center_y * dt_dy * stop_span;
     (t0 / stop_span, dt_dx, dt_dy)
 }
 
-fn gradient_lut(background: Background) -> [u32; 256] {
+pub(crate) fn gradient_lut(background: Background) -> [u32; 256] {
     let colors = background.colors();
     let first = Rgba::from(colors[0].color);
     let second = Rgba::from(colors[1].color);

@@ -7,7 +7,7 @@ use vello_cpu::{
 
 use crate::{
     kernels,
-    lower::{IRect, pack_hsla},
+    lower::{IRect, gradient_affine, gradient_lut, pack_hsla},
 };
 
 pub(crate) fn rasterize_path(
@@ -30,13 +30,18 @@ pub(crate) fn rasterize_path(
     if bezier.is_empty() {
         return;
     }
-    let color = match path.color.tag() {
-        BackgroundTag::LinearGradient => path.color.colors()[0].color,
-        _ => path.color.solid(),
+    let gradient = (path.color.tag() == BackgroundTag::LinearGradient).then(|| {
+        (
+            gradient_lut(path.color),
+            gradient_affine(path.color, path.bounds),
+        )
+    });
+    let color = if gradient.is_some() {
+        0xffff_ffff
+    } else {
+        pack_hsla(path.color.solid())
     };
-    let color = pack_hsla(color);
     let mut context = RenderContext::new(width, height);
-    context.set_aliasing_threshold(Some(127));
     context.set_transform(Affine::translate((
         f64::from(-rect.x0),
         f64::from(-rect.y0),
@@ -57,8 +62,19 @@ pub(crate) fn rasterize_path(
         let destination_start = (y as usize - band_y) * stride + rect.x0 as usize;
         let destination_row =
             &mut destination[destination_start..destination_start + width as usize];
-        for (destination, source) in destination_row.iter_mut().zip(source_row) {
+        for ((destination, source), x) in destination_row
+            .iter_mut()
+            .zip(source_row)
+            .zip(rect.x0..rect.x1)
+        {
             if source.a == 0 {
+                continue;
+            }
+            if let Some((lut, (t0, dt_dx, dt_dy))) = &gradient {
+                let t = t0 + (x as f32 + 0.5) * dt_dx + (y as f32 + 0.5) * dt_dy;
+                let color = lut[(t.clamp(0.0, 1.0) * 255.0).round() as usize];
+                let alpha = ((color >> 24) * u32::from(source.a) + 127) / 255;
+                *destination = kernels::blend_pixel(*destination, color, alpha as u8);
                 continue;
             }
             let straight = if source.a == 255 {

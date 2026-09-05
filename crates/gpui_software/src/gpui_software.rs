@@ -409,4 +409,127 @@ mod tests {
             atlas.remove(&key);
         }
     }
+    #[test]
+    fn borders_stay_inside_quad() {
+        for thickness in [1.0, 2.0, 20.0] {
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                bounds: bounds(
+                    point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                    size(ScaledPixels(10.0), ScaledPixels(1.0)),
+                ),
+                content_mask: mask(16.0, 16.0),
+                border_color: hsla(0.0, 0.0, 1.0, 0.5),
+                border_widths: gpui::Edges::all(ScaledPixels(thickness)),
+                ..Default::default()
+            });
+            scene.finish();
+            let mut renderer =
+                SoftwareRenderer::new(device_size(16, 16), FontCorrection::default());
+            renderer.draw(&scene, true);
+            assert!(
+                renderer.framebuffer().pixels()[16..]
+                    .iter()
+                    .all(|pixel| *pixel == 0xff00_0000)
+            );
+            assert!(
+                renderer.framebuffer().pixels()[..10]
+                    .iter()
+                    .all(|pixel| *pixel == 0xff80_8080)
+            );
+        }
+    }
+
+    fn rectangle_path(left: f32, right: f32) -> Path<ScaledPixels> {
+        let mut path = Path::new(point(px(left), px(1.0)));
+        path.line_to(point(px(right), px(1.0)));
+        path.line_to(point(px(right), px(9.0)));
+        path.line_to(point(px(left), px(9.0)));
+        path.color = hsla(0.0, 0.0, 1.0, 1.0).into();
+        path.content_mask = ContentMask {
+            bounds: bounds(point(px(0.0), px(0.0)), size(px(16.0), px(16.0))),
+        };
+        path.scale(1.0)
+    }
+
+    #[test]
+    fn thin_paths_remain_visible() {
+        for (left, right) in [(0.35, 0.75), (0.1, 0.4)] {
+            let mut scene = Scene::default();
+            scene.insert_primitive(rectangle_path(left, right));
+            scene.finish();
+            let mut renderer =
+                SoftwareRenderer::new(device_size(16, 16), FontCorrection::default());
+            renderer.draw(&scene, true);
+            assert!(
+                renderer
+                    .framebuffer()
+                    .pixels()
+                    .iter()
+                    .any(|pixel| *pixel != 0xff00_0000)
+            );
+        }
+    }
+
+    #[test]
+    fn path_gradients_preserve_opacity() {
+        for descending in [false, true] {
+            let mut path = rectangle_path(1.0, 9.0);
+            path.color = linear_gradient(
+                90.0,
+                linear_color_stop(hsla(0.0, 0.0, 1.0, 0.0), if descending { 1.0 } else { 0.0 }),
+                linear_color_stop(hsla(0.0, 0.0, 1.0, 1.0), if descending { 0.0 } else { 1.0 }),
+            );
+            let mut scene = Scene::default();
+            scene.insert_primitive(path);
+            scene.finish();
+            let mut renderer =
+                SoftwareRenderer::new(device_size(16, 16), FontCorrection::default());
+            renderer.draw(&scene, true);
+            let pixels = renderer.framebuffer().pixels();
+            if descending {
+                assert!(pixels[4 * 16 + 1] > pixels[4 * 16 + 8]);
+            } else {
+                assert!(pixels[4 * 16 + 1] < pixels[4 * 16 + 8]);
+            }
+        }
+    }
+
+    #[test]
+    fn singular_sprites_are_empty() {
+        let mut renderer = SoftwareRenderer::new(device_size(16, 16), FontCorrection::default());
+        let tile = renderer
+            .atlas()
+            .get_or_insert_with(
+                &AtlasKey::Svg(RenderSvgParams {
+                    path: SharedString::from("singular"),
+                    size: device_size(2, 2),
+                }),
+                &mut || Ok(Some((device_size(2, 2), Cow::Borrowed(&[255; 4])))),
+            )
+            .expect("insert")
+            .expect("tile");
+        let mut scene = Scene::default();
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: mask(2.0, 2.0).bounds,
+            content_mask: mask(16.0, 16.0),
+            color: hsla(0.0, 0.0, 1.0, 1.0),
+            tile,
+            transformation: TransformationMatrix {
+                rotation_scale: [[1.0, 1.0], [1.0, 1.0]],
+                translation: [0.0; 2],
+            },
+        });
+        scene.finish();
+        renderer.draw(&scene, true);
+        assert!(
+            renderer
+                .framebuffer()
+                .pixels()
+                .iter()
+                .all(|pixel| *pixel == 0xff00_0000)
+        );
+    }
 }
