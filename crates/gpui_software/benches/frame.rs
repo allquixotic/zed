@@ -23,15 +23,15 @@ fn content_mask(width: i32, height: i32) -> ContentMask<ScaledPixels> {
     }
 }
 
-fn glyph_tile(renderer: &SoftwareRenderer) -> AtlasTile {
+fn glyph_tile(renderer: &SoftwareRenderer, variant: usize) -> AtlasTile {
     let glyph_size = device_size(6, 10);
     let key = AtlasKey::Svg(RenderSvgParams {
-        path: SharedString::from("software-benchmark-glyph"),
+        path: SharedString::from(format!("software-benchmark-glyph-{variant}")),
         size: glyph_size,
     });
     let coverage = (0..60)
         .map(|index| {
-            if index % 6 == 0 || index % 6 == 5 {
+            if (index * 17 + variant * 7) % 11 < 4 {
                 96
             } else {
                 220
@@ -49,7 +49,7 @@ fn glyph_tile(renderer: &SoftwareRenderer) -> AtlasTile {
 
 fn editor_scene(
     window_size: Size<DevicePixels>,
-    tile: AtlasTile,
+    tiles: &[AtlasTile],
     changed_line: bool,
     scroll_offset: i32,
 ) -> Scene {
@@ -92,7 +92,7 @@ fn editor_scene(
         };
         scene.insert_primitive(path.scale(1.0));
     }
-    for index in 0..8_000 {
+    for index in 0..(window_size.height.0 / 14 + 4) * 100 {
         let column = index % 100;
         let row = index / 100;
         let y = 40 + row * 14 - scroll_offset;
@@ -102,7 +102,7 @@ fn editor_scene(
         let color = if changed_line && row == 20 {
             hsla(0.12, 0.8, 0.65, 1.0)
         } else {
-            hsla(0.0, 0.0, 0.82, 1.0)
+            hsla((row % 13) as f32 / 13.0, 0.3, 0.82, 1.0)
         };
         scene.insert_primitive(MonochromeSprite {
             order: 0,
@@ -116,7 +116,7 @@ fn editor_scene(
             ),
             content_mask: mask,
             color,
-            tile,
+            tile: tiles[(index * 7 + row * 3) as usize % tiles.len()],
             transformation: TransformationMatrix::unit(),
         });
     }
@@ -131,8 +131,10 @@ fn frame_benchmarks(criterion: &mut Criterion) {
         ("4k", device_size(3840, 2160)),
     ] {
         let mut renderer = SoftwareRenderer::new(window_size, FontCorrection::default());
-        let tile = glyph_tile(&renderer);
-        let scene = editor_scene(window_size, tile, false, 0);
+        let tiles = (0..16)
+            .map(|variant| glyph_tile(&renderer, variant))
+            .collect::<Vec<_>>();
+        let scene = editor_scene(window_size, &tiles, false, 0);
         criterion.bench_with_input(
             BenchmarkId::new(format!("full-{name}"), thread_count),
             &thread_count,
@@ -141,8 +143,9 @@ fn frame_benchmarks(criterion: &mut Criterion) {
             },
         );
 
-        let base = editor_scene(window_size, tile, false, 0);
-        let changed = editor_scene(window_size, tile, true, 0);
+        let base = editor_scene(window_size, &tiles, false, 0);
+        let changed = editor_scene(window_size, &tiles, true, 0);
+        validate_pair(&mut renderer, &base, &changed, false);
         renderer.draw(&base, true);
         let mut alternate = false;
         criterion.bench_with_input(
@@ -157,7 +160,8 @@ fn frame_benchmarks(criterion: &mut Criterion) {
             },
         );
 
-        let scrolled = editor_scene(window_size, tile, false, 14);
+        let scrolled = editor_scene(window_size, &tiles, false, 14);
+        validate_pair(&mut renderer, &base, &scrolled, true);
         renderer.draw(&base, true);
         criterion.bench_with_input(
             BenchmarkId::new(format!("scroll-{name}"), thread_count),
@@ -170,7 +174,67 @@ fn frame_benchmarks(criterion: &mut Criterion) {
                 });
             },
         );
+        let smooth = editor_scene(window_size, &tiles, false, 3);
+        validate_pair(&mut renderer, &base, &smooth, true);
+        criterion.bench_function(&format!("smooth-scroll-{name}/{thread_count}"), |bencher| {
+            bencher.iter(|| {
+                alternate = !alternate;
+                black_box(renderer.draw(black_box(if alternate { &smooth } else { &base }), false))
+            });
+        });
+        criterion.bench_function(&format!("unchanged-{name}/{thread_count}"), |bencher| {
+            renderer.draw(&base, true);
+            assert!(renderer.draw(&base, false).is_empty());
+            bencher.iter(|| black_box(renderer.draw(black_box(&base), false)));
+        });
     }
+    let mut renderer = SoftwareRenderer::new(device_size(1024, 768), FontCorrection::default());
+    let mut scene = Scene::default();
+    let mut path = Path::new(point(px(64.0), px(64.0)));
+    for index in 0..64 {
+        let angle = index as f32 * std::f32::consts::TAU / 64.0;
+        path.line_to(point(
+            px(512.0 + 420.0 * angle.cos()),
+            px(384.0 + 300.0 * angle.sin()),
+        ));
+    }
+    path.color = hsla(0.55, 0.5, 0.55, 0.6).into();
+    path.content_mask = ContentMask {
+        bounds: bounds(point(px(0.0), px(0.0)), size(px(1024.0), px(768.0))),
+    };
+    scene.insert_primitive(path.scale(1.0));
+    scene.finish();
+    renderer.draw(&scene, true);
+    assert!(
+        renderer
+            .framebuffer()
+            .pixels()
+            .iter()
+            .any(|pixel| *pixel != 0xff00_0000)
+    );
+    criterion.bench_function(&format!("large-path/{thread_count}"), |bencher| {
+        bencher.iter(|| black_box(renderer.draw(black_box(&scene), true)));
+    });
+}
+
+fn validate_pair(renderer: &mut SoftwareRenderer, base: &Scene, changed: &Scene, scrolling: bool) {
+    renderer.draw(base, true);
+    let before = renderer.framebuffer().pixels().to_vec();
+    let damage = renderer.draw(changed, false);
+    assert!(!damage.is_empty());
+    let incremental = renderer.framebuffer().pixels().to_vec();
+    assert_ne!(incremental, before);
+    if scrolling {
+        let stride = renderer.framebuffer().size().width.0 as usize;
+        assert_ne!(
+            &incremental[100 * stride..200 * stride],
+            &before[100 * stride..200 * stride]
+        );
+    }
+    renderer.draw(changed, true);
+    assert_eq!(incremental, renderer.framebuffer().pixels());
+    renderer.draw(base, false);
+    assert_eq!(before, renderer.framebuffer().pixels());
 }
 
 criterion_group!(benches, frame_benchmarks);
