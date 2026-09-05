@@ -203,6 +203,7 @@ fn hash_tile(tile: AtlasTile, hasher: &mut impl Hasher) {
 
 #[derive(Default)]
 pub(crate) struct LoweringCache {
+    pub spare_ops: Vec<Op>,
     correction: FontCorrection,
     pub luts: LutCache,
     gradient_indices: collections::FxHashMap<[u32; 9], usize>,
@@ -261,8 +262,11 @@ pub(crate) fn lower_scene(
         cache.luts = LutCache::default();
         cache.correction = correction;
     }
+    let mut ops = std::mem::take(&mut cache.spare_ops);
+    ops.clear();
+    ops.reserve(scene.len());
     let mut lowerer = Lowerer {
-        ops: Vec::with_capacity(scene.len()),
+        ops,
         cache,
         paths: Vec::new(),
     };

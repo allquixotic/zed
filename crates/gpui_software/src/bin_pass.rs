@@ -16,6 +16,7 @@ pub(crate) struct Cell {
     pub opaque_cutoff: Option<usize>,
 }
 
+#[derive(Default)]
 pub(crate) struct BinGrid {
     columns: usize,
     rows: usize,
@@ -24,23 +25,37 @@ pub(crate) struct BinGrid {
 }
 
 impl BinGrid {
+    #[cfg(test)]
     pub fn new(
         size: Size<DevicePixels>,
         ops: &[Op],
         atlas: &crate::atlas::SoftwareAtlasState,
     ) -> Self {
+        let mut grid = Self::default();
+        grid.update(size, ops, atlas);
+        grid
+    }
+
+    pub fn update(
+        &mut self,
+        size: Size<DevicePixels>,
+        ops: &[Op],
+        atlas: &crate::atlas::SoftwareAtlasState,
+    ) {
         let width = size.width.0.max(0) as usize;
         let height = size.height.0.max(0) as usize;
         let columns = width.div_ceil(CELL_WIDTH);
         let rows = height.div_ceil(BAND_HEIGHT);
-        let mut grid = Self {
-            columns,
-            rows,
-            size,
-            cells: (0..columns.saturating_mul(rows))
-                .map(|_| Cell::default())
-                .collect(),
-        };
+        self.columns = columns;
+        self.rows = rows;
+        self.size = size;
+        self.cells
+            .resize_with(columns.saturating_mul(rows), Cell::default);
+        for cell in &mut self.cells {
+            cell.ops.clear();
+            cell.hash = 0;
+            cell.opaque_cutoff = None;
+        }
         let frame = framebuffer_rect(size);
         for (op_index, op) in ops.iter().enumerate() {
             let rect = op.rect().intersect(frame);
@@ -54,8 +69,8 @@ impl BinGrid {
             let op_hash = op.hash(atlas);
             for row in first_row..=last_row.min(rows.saturating_sub(1)) {
                 for column in first_column..=last_column.min(columns.saturating_sub(1)) {
-                    let cell_rect = grid.cell_rect(row, column);
-                    let cell = &mut grid.cells[row * columns + column];
+                    let cell_rect = self.cell_rect(row, column);
+                    let cell = &mut self.cells[row * columns + column];
                     if op.is_opaque_rectangle() && rect.contains(cell_rect) {
                         cell.opaque_cutoff = Some(cell.ops.len());
                     }
@@ -67,7 +82,6 @@ impl BinGrid {
                 }
             }
         }
-        grid
     }
 
     pub fn columns(&self) -> usize {

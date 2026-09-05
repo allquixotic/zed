@@ -26,6 +26,7 @@ pub struct SoftwareRenderer {
     atlas: Arc<SoftwareAtlas>,
     font_correction: FontCorrection,
     lowering_cache: LoweringCache,
+    bins: BinGrid,
     previous_hashes: Vec<u64>,
     previous_grid_size: (usize, usize),
     force_full: bool,
@@ -38,6 +39,7 @@ impl SoftwareRenderer {
             atlas: Arc::new(SoftwareAtlas::new()),
             font_correction,
             lowering_cache: LoweringCache::default(),
+            bins: BinGrid::default(),
             previous_hashes: Vec::new(),
             previous_grid_size: (0, 0),
             force_full: true,
@@ -71,14 +73,16 @@ impl SoftwareRenderer {
         );
         let lower_elapsed = frame_start.elapsed();
         let atlas = self.atlas.lock();
-        let bins = BinGrid::new(self.framebuffer.size(), &lowered.ops, &atlas);
+        self.bins
+            .update(self.framebuffer.size(), &lowered.ops, &atlas);
+        let bins = &self.bins;
         let bin_elapsed = frame_start.elapsed() - lower_elapsed;
         let force_full = force_full
             || self.force_full
             || self.previous_grid_size != (bins.columns(), bins.rows());
         let damage = damage::compute_damage(
             self.framebuffer.size(),
-            &bins,
+            bins,
             &self.previous_hashes,
             force_full,
         );
@@ -86,7 +90,7 @@ impl SoftwareRenderer {
 
         let raster_start = std::time::Instant::now();
         if !damage.rects.is_empty() {
-            raster::rasterize(&mut self.framebuffer, &lowered, &bins, &damage, &atlas);
+            raster::rasterize(&mut self.framebuffer, &lowered, bins, &damage, &atlas);
         }
         let raster_elapsed = raster_start.elapsed();
 
@@ -104,6 +108,7 @@ impl SoftwareRenderer {
             &damage,
         );
         self.lowering_cache = lowered.cache;
+        self.lowering_cache.spare_ops = lowered.ops;
         self.lowering_cache.trim();
         damage
     }
