@@ -130,21 +130,18 @@ pub(crate) fn rasterize_path(
                     *destination = kernels::blend_pixel(*destination, color, alpha as u8);
                     continue;
                 }
-                let straight = if source.a == 255 {
-                    (u32::from(source.r) << 16) | (u32::from(source.g) << 8) | u32::from(source.b)
-                } else {
-                    let unpremultiply = |channel: u8| {
-                        ((u32::from(channel) * 255 + u32::from(source.a) / 2) / u32::from(source.a))
-                            .min(255)
-                    };
-                    (unpremultiply(source.r) << 16)
-                        | (unpremultiply(source.g) << 8)
-                        | unpremultiply(source.b)
-                };
-                *destination = kernels::blend_pixel(*destination, straight, source.a);
+                *destination = blend_premultiplied(*destination, *source);
             }
         }
     });
+}
+
+fn blend_premultiplied(destination: u32, source: PremulRgba8) -> u32 {
+    let blend = |channel: u8, shift: u32| {
+        let background = (destination >> shift) & 255;
+        (u32::from(channel) + (background * (255 - u32::from(source.a)) + 127) / 255).min(255)
+    };
+    0xff00_0000 | (blend(source.r, 16) << 16) | (blend(source.g, 8) << 8) | blend(source.b, 0)
 }
 
 fn to_bezier_path(path: &Path<ScaledPixels>) -> BezPath {
@@ -183,4 +180,40 @@ fn to_bezier_path(path: &Path<ScaledPixels>) -> BezPath {
         bezier.close_path();
     }
     bezier
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn premultiplied_compositing_matches_source_over() {
+        for alpha in 0..=255u32 {
+            for channel in 0..=alpha {
+                for background in 0..=255u32 {
+                    let source = PremulRgba8 {
+                        r: channel as u8,
+                        g: channel as u8,
+                        b: channel as u8,
+                        a: alpha as u8,
+                    };
+                    let actual = blend_premultiplied(background * 0x010101, source) & 255;
+                    let expected = (f64::from(channel)
+                        + f64::from(background) * (1.0 - f64::from(alpha) / 255.0))
+                        .round() as u32;
+                    assert_eq!(actual, expected);
+                    let straight = if alpha == 0 {
+                        0
+                    } else {
+                        ((channel * 255 + alpha / 2) / alpha).min(255)
+                    };
+                    let previous = kernels::blend_pixel(background, straight, alpha as u8) & 255;
+                    assert!(
+                        actual.abs_diff(previous) <= 2,
+                        "alpha {alpha}, channel {channel}, background {background}"
+                    );
+                }
+            }
+        }
+    }
 }
