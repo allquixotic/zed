@@ -604,4 +604,45 @@ mod tests {
             assert!(renderer.draw(&scene, false).is_empty());
         }
     }
+
+    #[test]
+    fn fully_occluded_changes_do_not_damage_the_frame() {
+        let scene = |hue| {
+            let mut scene = damage_scene(hsla(hue, 0.5, 0.5, 1.0));
+            scene.insert_primitive(Quad {
+                bounds: mask(128.0, 64.0).bounds, content_mask: mask(128.0, 64.0),
+                background: hsla(0.5, 0.5, 0.5, 1.0).into(), ..Default::default()
+            });
+            scene.finish();
+            scene
+        };
+        let mut renderer = SoftwareRenderer::new(device_size(128, 64), FontCorrection::default());
+        renderer.draw(&scene(0.0), false);
+        let before = renderer.framebuffer().pixels().to_vec();
+        assert!(renderer.draw(&scene(0.5), false).is_empty());
+        assert_eq!(before, renderer.framebuffer().pixels());
+    }
+
+    #[test]
+    fn unrelated_path_insertion_preserves_clean_cells() {
+        let scene = |insert| {
+            let mut scene = Scene::default();
+            if insert {
+                scene.insert_primitive(rectangle_path(1.0, 9.0));
+            }
+            let mut path = rectangle_path(70.0, 80.0);
+            path.content_mask = mask(128.0, 64.0);
+            scene.insert_primitive(path);
+            scene.finish();
+            scene
+        };
+        let mut renderer = SoftwareRenderer::new(device_size(128, 64), FontCorrection::default());
+        renderer.draw(&scene(false), false);
+        let damage = renderer.draw(&scene(true), false);
+        assert!(!damage.is_empty());
+        assert!(damage.rects.iter().all(|rect| rect.origin.x.0 + rect.size.width.0 <= 64));
+        let incremental = renderer.framebuffer().pixels().to_vec();
+        renderer.draw(&scene(true), true);
+        assert_eq!(incremental, renderer.framebuffer().pixels());
+    }
 }

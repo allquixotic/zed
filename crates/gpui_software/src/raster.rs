@@ -36,11 +36,10 @@ pub(crate) fn rasterize(
             }
             let cell = bins.cell(band, column);
             let cell_rect = bins.cell_rect(band, column);
-            let start = cell.opaque_cutoff.unwrap_or(0);
-            if cell.opaque_cutoff.is_none() {
+            if !cell.has_opaque_cover {
                 kernels::fill_opaque(pixels, stride, band_y, cell_rect, 0xff00_0000);
             }
-            for op_index in &cell.ops[start..] {
+            for op_index in &cell.ops {
                 let Some(op) = frame.ops.get(*op_index as usize) else {
                     continue;
                 };

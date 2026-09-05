@@ -120,14 +120,12 @@ impl Op {
                 color.hash(&mut hasher)
             }
             Self::FillGradient {
-                gradient,
                 content_hash,
                 t0,
                 dt_dx,
                 dt_dy,
                 ..
             } => {
-                gradient.hash(&mut hasher);
                 content_hash.hash(&mut hasher);
                 t0.to_bits().hash(&mut hasher);
                 dt_dx.to_bits().hash(&mut hasher);
@@ -173,10 +171,7 @@ impl Op {
                 opacity.hash(&mut hasher);
                 grayscale.hash(&mut hasher);
             }
-            Self::Path {
-                path, content_hash, ..
-            } => {
-                path.hash(&mut hasher);
+            Self::Path { content_hash, .. } => {
                 content_hash.hash(&mut hasher);
             }
         }

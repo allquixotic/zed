@@ -13,7 +13,7 @@ pub(crate) const CELL_WIDTH: usize = 64;
 pub(crate) struct Cell {
     pub ops: Vec<u32>,
     pub hash: u64,
-    pub opaque_cutoff: Option<usize>,
+    pub has_opaque_cover: bool,
 }
 
 #[derive(Default)]
@@ -54,7 +54,7 @@ impl BinGrid {
         for cell in &mut self.cells {
             cell.ops.clear();
             cell.hash = 0;
-            cell.opaque_cutoff = None;
+            cell.has_opaque_cover = false;
         }
         let frame = framebuffer_rect(size);
         for (op_index, op) in ops.iter().enumerate() {
@@ -72,7 +72,9 @@ impl BinGrid {
                     let cell_rect = self.cell_rect(row, column);
                     let cell = &mut self.cells[row * columns + column];
                     if op.is_opaque_rectangle() && rect.contains(cell_rect) {
-                        cell.opaque_cutoff = Some(cell.ops.len());
+                        cell.ops.clear();
+                        cell.hash = 0;
+                        cell.has_opaque_cover = true;
                     }
                     cell.ops.push(op_index as u32);
                     let mut hasher = collections::FxHasher::default();
@@ -144,6 +146,7 @@ mod tests {
             &ops,
             &crate::SoftwareAtlas::new().lock(),
         );
-        assert_eq!(grid.cell(0, 0).opaque_cutoff, Some(1));
+        assert_eq!(grid.cell(0, 0).ops, [1, 2]);
+        assert!(grid.cell(0, 0).has_opaque_cover);
     }
 }

@@ -245,6 +245,39 @@ fn frame_benchmarks(criterion: &mut Criterion) {
     criterion.bench_function(&format!("gradients/{thread_count}"), |bencher| {
         bencher.iter(|| black_box(renderer.draw(black_box(&scene), true)));
     });
+
+    let hidden = |hue| {
+        let mut scene = Scene::default();
+        for index in 0..100 {
+            scene.insert_primitive(Quad {
+                bounds: content_mask(1024, 768).bounds,
+                content_mask: content_mask(1024, 768),
+                background: hsla(hue + index as f32 / 100.0, 0.5, 0.4, 0.5).into(),
+                ..Default::default()
+            });
+        }
+        scene.insert_primitive(Quad {
+            bounds: content_mask(1024, 768).bounds,
+            content_mask: content_mask(1024, 768),
+            background: hsla(0.6, 0.5, 0.4, 1.0).into(),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    };
+    let base = hidden(0.0);
+    let changed = hidden(0.2);
+    renderer.draw(&base, true);
+    let expected = renderer.framebuffer().pixels().to_vec();
+    renderer.draw(&changed, false);
+    assert_eq!(expected, renderer.framebuffer().pixels());
+    let mut alternate = false;
+    criterion.bench_function(&format!("occluded/{thread_count}"), |bencher| {
+        bencher.iter(|| {
+            alternate = !alternate;
+            black_box(renderer.draw(black_box(if alternate { &base } else { &changed }), false))
+        });
+    });
 }
 
 fn capture(renderer: &SoftwareRenderer, name: &str) {
