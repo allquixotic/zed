@@ -73,3 +73,12 @@ if grep -F 'feature "test-support"' <<<"${feature_tree}"; then
   exit 1
 fi
 ```
+
+For an X11 software run, build the same runner and set `GPUI_RENDERER=software`
+with `DISPLAY` set and `WAYLAND_DISPLAY` unset. Use `run --output PATH`; the
+`compare` controller still enforces its Wayland baseline contract. X11 software
+selection is explicit; automatic selection retains the existing WGPU behavior.
+
+`GPUI_BENCHMARK_HOLD_AFTER_REPORT=1` keeps the final window open after writing the
+report. This supports external exposure and resize probes against an unchanged
+scene. Run this mode under a watchdog and terminate the process after probing.
