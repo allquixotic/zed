@@ -227,7 +227,7 @@ pub(crate) struct WaylandSoftwareRenderer {
     renderer: SoftwareRenderer,
     font_correction: FontCorrection,
     buffers: Vec<ShmBuffer>,
-    next_buffer: usize,
+    presentation_sequence: u64,
     pending_surface_damage: Vec<Bounds<DevicePixels>>,
     globals: Globals,
 }
@@ -239,7 +239,7 @@ impl WaylandSoftwareRenderer {
             renderer: SoftwareRenderer::new(size, FontCorrection::default()),
             font_correction: FontCorrection::default(),
             buffers: create_buffers(size, globals)?,
-            next_buffer: 0,
+            presentation_sequence: 0,
             pending_surface_damage: Vec::new(),
             globals: globals.clone(),
         })
@@ -271,6 +271,8 @@ impl WaylandSoftwareRenderer {
         damage_surface(surface, &self.pending_surface_damage);
         surface.commit();
         self.pending_surface_damage.clear();
+        self.presentation_sequence = self.presentation_sequence.wrapping_add(1);
+        buffer.last_presented = self.presentation_sequence;
 
         if software_stats_enabled() {
             log::info!(
@@ -282,15 +284,31 @@ impl WaylandSoftwareRenderer {
     }
 
     fn acquire_buffer(&mut self) -> Option<usize> {
-        for offset in 0..self.buffers.len() {
-            let index = (self.next_buffer + offset) % self.buffers.len();
-            if self.buffers[index]
+        let newest = newest_released_buffer(self.buffers.iter().map(|buffer| {
+            (
+                buffer.released.load(Ordering::Acquire),
+                buffer.last_presented,
+            )
+        }));
+        if let Some(index) = newest
+            && self.buffers[index]
                 .released
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
-            {
-                self.next_buffer = (index + 1) % self.buffers.len();
-                return Some(index);
+        {
+            return Some(index);
+        }
+        if self.buffers.len() < BUFFER_COUNT {
+            match ShmBuffer::new(self.renderer.framebuffer().size(), &self.globals) {
+                Ok(buffer) => {
+                    buffer.released.store(false, Ordering::Release);
+                    let index = self.buffers.len();
+                    self.buffers.push(buffer);
+                    return Some(index);
+                }
+                Err(error) => log::error!(
+                    "Failed to allocate an additional Wayland software buffer: {error:#}"
+                ),
             }
         }
         None
@@ -304,7 +322,7 @@ impl WaylandSoftwareRenderer {
         let buffers = create_buffers(size, &self.globals)?;
         self.renderer.resize(size);
         self.buffers = buffers;
-        self.next_buffer = 0;
+        self.presentation_sequence = 0;
         self.pending_surface_damage.clear();
         Ok(())
     }
@@ -357,6 +375,7 @@ struct ShmBuffer {
     mapping: MmapMut,
     released: Arc<AtomicBool>,
     pending_damage: Vec<Bounds<DevicePixels>>,
+    last_presented: u64,
 }
 
 impl ShmBuffer {
@@ -394,7 +413,8 @@ impl ShmBuffer {
             _file: file,
             mapping,
             released,
-            pending_damage: Vec::new(),
+            pending_damage: vec![Bounds::new(Default::default(), size)],
+            last_presented: 0,
         })
     }
 
@@ -457,9 +477,15 @@ fn normalized_size(size: Size<DevicePixels>) -> Size<DevicePixels> {
 }
 
 fn create_buffers(size: Size<DevicePixels>, globals: &Globals) -> Result<Vec<ShmBuffer>> {
-    (0..BUFFER_COUNT)
-        .map(|_| ShmBuffer::new(size, globals))
-        .collect()
+    Ok(vec![ShmBuffer::new(size, globals)?])
+}
+
+fn newest_released_buffer(buffers: impl Iterator<Item = (bool, u64)>) -> Option<usize> {
+    buffers
+        .enumerate()
+        .filter(|(_, (released, _))| *released)
+        .max_by_key(|(_, (_, last_presented))| *last_presented)
+        .map(|(index, _)| index)
 }
 
 fn append_damage(
@@ -490,7 +516,24 @@ fn software_stats_enabled() -> bool {
 mod tests {
     use gpui::{DevicePixels, bounds, point, size};
 
-    use super::{MAX_DAMAGE_RECTS, append_damage};
+    use super::{MAX_DAMAGE_RECTS, append_damage, newest_released_buffer};
+
+    #[test]
+    fn newest_released_buffer_never_reuses_a_busy_buffer() {
+        assert_eq!(
+            newest_released_buffer([(false, 9), (true, 8), (true, 3)].into_iter()),
+            Some(1)
+        );
+        assert_eq!(
+            newest_released_buffer([(true, 10), (true, 8), (true, 3)].into_iter()),
+            Some(0)
+        );
+        assert_eq!(
+            newest_released_buffer([(false, 9), (false, 8)].into_iter()),
+            None
+        );
+        assert_eq!(newest_released_buffer([].into_iter()), None);
+    }
 
     #[test]
     fn damage_collapses_to_the_full_buffer() {
