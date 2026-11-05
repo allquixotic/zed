@@ -19,6 +19,9 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
       - name: Install Linux dependencies
         run: ./script/linux
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a
+        with:
+          cache-on-failure: true
       - name: Check Linux presenters
         run: cargo check --locked -p gpui_linux -p gpui_renderer_bench
       - name: Test portable CPU rendering
@@ -43,7 +46,12 @@ jobs:
           Get-ChildItem Env: | Where-Object { $_.Name -match '^(PATH|INCLUDE|LIB|LIBPATH|VCToolsInstallDir|VSINSTALLDIR|WindowsSdkDir|WindowsSDKVersion)$' } | ForEach-Object {
             "$($_.Name)=$($_.Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           }
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a
+        with:
+          cache-on-failure: true
       - name: Test native Windows and CPU rendering
+        env:
+          GPUI_D3D_ADAPTER: warp
         shell: pwsh
         run: cargo test --locked -p gpui -p gpui_software -p gpui_windows --lib
       - name: Build optimized Windows x64 installer

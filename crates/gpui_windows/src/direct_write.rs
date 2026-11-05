@@ -2158,7 +2158,10 @@ mod tests {
     }
 
     fn check_unicode_separator_cursor(separator: char) -> Result<()> {
-        let platform_text_system = Arc::new(DirectWriteTextSystem::new(None)?);
+        let platform_text_system = Arc::new(DirectWriteTextSystem::new(
+            None,
+            gpui_software::FontCorrection::default(),
+        )?);
         let font = Font {
             family: "Segoe UI".into(),
             ..Default::default()

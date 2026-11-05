@@ -87,7 +87,7 @@ impl WindowsRenderer {
         matches!(self, Self::Software(_))
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(feature = "test-support")]
     pub(crate) fn render_to_image(
         &mut self,
         scene: &Scene,
@@ -158,7 +158,7 @@ impl SoftwareWindowRenderer {
         self.force_presentation = true;
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(feature = "test-support")]
     fn render_to_image(&mut self, scene: &Scene) -> Result<image::RgbaImage> {
         self.renderer.draw(scene, true);
         let framebuffer = self.renderer.framebuffer();

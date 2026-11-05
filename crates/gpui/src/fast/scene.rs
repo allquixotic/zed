@@ -1,7 +1,4 @@
-//! Putting a finished scene in drawing order without moving its primitives
-//! more than once or allocating, and scene helpers for tests: a finished scene
-//! described as text, to compare two frames by, and forgetting the orderings
-//! the bounds tree replays.
+//! Reuses sort storage between frames and skips primitives already in drawing order.
 
 use crate::{
     DrawOrder, MonochromeSprite, PaintSurface, Path, PolychromeSprite, Quad, ScaledPixels, Scene,

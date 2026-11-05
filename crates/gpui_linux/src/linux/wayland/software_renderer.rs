@@ -342,7 +342,7 @@ impl WaylandSoftwareRenderer {
         self.renderer.atlas()
     }
 
-    fn gpu_specs(&self) -> Option<GpuSpecs> {
+    fn gpu_specs(&self) -> GpuSpecs {
         self.renderer.gpu_specs()
     }
 
