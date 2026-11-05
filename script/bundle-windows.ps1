@@ -3,7 +3,10 @@ Param(
     [Parameter()][Alias('i')][switch]$Install,
     [Parameter()][Alias('h')][switch]$Help,
     [Parameter()][Alias('a')][string]$Architecture,
-    [Parameter()][string]$Name
+    [Parameter()][string]$Name,
+    [Parameter()][switch]$BuildOnly,
+    [Parameter()][switch]$PackageOnly,
+    [Parameter()][switch]$RequireSigning
 )
 
 . "$PSScriptRoot/lib/workspace.ps1"
@@ -14,6 +17,7 @@ $PSNativeCommandUseErrorActionPreference = $true
 
 $buildSuccess = $false
 $canCodeSign = $false
+if ($BuildOnly -and $PackageOnly) { throw 'BuildOnly and PackageOnly cannot be combined' }
 
 $OSArchitecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
     "X64" { "x86_64" }
@@ -68,7 +72,7 @@ $env:RELEASE_CHANNEL = $channel
 Pop-Location
 
 function CheckEnvironmentVariables {
-    if(-not $env:CI) {
+    if(-not $env:CI -and -not $RequireSigning) {
         return
     }
 
@@ -79,6 +83,17 @@ function CheckEnvironmentVariables {
             Write-Error "$var is not set"
             exit 1
         }
+    }
+
+    if ($BuildOnly) { return }
+
+    if ($env:ZED_SIGNING_AUTH -eq 'azure-cli') {
+        foreach ($var in @('ACCOUNT_NAME', 'CERT_PROFILE_NAME', 'ENDPOINT', 'FILE_DIGEST', 'TIMESTAMP_DIGEST', 'TIMESTAMP_SERVER', 'ZED_WINDOWS_PUBLISHER')) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($var))) { throw "$var is required for OIDC signing" }
+        }
+        Import-Module TrustedSigning -RequiredVersion 0.5.8 -ErrorAction Stop
+        $script:canCodeSign = $true
+        return
     }
 
     # On PRs from forks the signing secrets are not populated,
@@ -98,6 +113,7 @@ function CheckEnvironmentVariables {
         Write-Host "This bundle will not be code signed"
         Write-Host "====== WARNING ======"
     }
+    if ($RequireSigning -and -not $script:canCodeSign) { throw 'Signing was required, but no signing credentials were configured' }
 }
 
 function PrepareForBundle {
@@ -121,28 +137,31 @@ function GenerateLicenses {
 function BuildZedAndItsFriends {
     Write-Output "Building Zed and its friends, for channel: $channel"
     # Build zed.exe, cli.exe and auto_update_helper.exe
-    cargo --config .cargo/bundle-config.toml build --release --package zed --package cli --package auto_update_helper --target $target
+    cargo --config .cargo/bundle-config.toml build --locked --release --package zed --package cli --package auto_update_helper --target $target
     Copy-Item -Path ".\$CargoOutDir\zed.exe" -Destination "$innoDir\Zed.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\cli.exe" -Destination "$innoDir\cli.exe" -Force
     Copy-Item -Path ".\$CargoOutDir\auto_update_helper.exe" -Destination "$innoDir\auto_update_helper.exe" -Force
     # Build explorer_command_injector.dll
     switch ($channel) {
         "stable" {
-            cargo --config .cargo/bundle-config.toml build --release --features stable --no-default-features --package explorer_command_injector --target $target
+            cargo --config .cargo/bundle-config.toml build --locked --release --features stable --no-default-features --package explorer_command_injector --target $target
         }
         "preview" {
-            cargo --config .cargo/bundle-config.toml build --release --features preview --no-default-features --package explorer_command_injector --target $target
+            cargo --config .cargo/bundle-config.toml build --locked --release --features preview --no-default-features --package explorer_command_injector --target $target
         }
         default {
-            cargo --config .cargo/bundle-config.toml build --release --package explorer_command_injector --target $target
+            cargo --config .cargo/bundle-config.toml build --locked --release --package explorer_command_injector --target $target
         }
     }
     Copy-Item -Path ".\$CargoOutDir\explorer_command_injector.dll" -Destination "$innoDir\zed_explorer_command_injector.dll" -Force
 }
 
 function BuildRemoteServer {
+    param([switch]$SkipBuild)
     Write-Output "Building remote_server for $target"
-    cargo --config .cargo/bundle-config.toml build --release --package remote_server --target $target
+    if (-not $SkipBuild) {
+        cargo --config .cargo/bundle-config.toml build --locked --release --package remote_server --target $target
+    }
 
     # Create zipped remote server binary
     $remoteServerSrc = (Resolve-Path ".\$CargoOutDir\remote_server.exe").Path
@@ -212,10 +231,19 @@ function MakeAppx {
         }
     }
     Copy-Item -Path "$manifestFile" -Destination "$innoDir\make_appx\AppxManifest.xml"
+    [xml]$appxManifest = Get-Content -Raw "$innoDir\make_appx\AppxManifest.xml"
+    if ($env:ZED_WINDOWS_PUBLISHER) {
+        $appxManifest.Package.Identity.Publisher = $env:ZED_WINDOWS_PUBLISHER
+        $appxManifest.Package.Properties.PublisherDisplayName = 'Sean McNamara'
+        $appxManifest.Save("$innoDir\make_appx\AppxManifest.xml")
+    }
+    $script:appxName = $appxManifest.Package.Identity.Name
+    $script:appxPublisher = $appxManifest.Package.Identity.Publisher
     # Add makeAppx.exe to Path
-    $sdk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"
-    $env:Path += ';' + $sdk
-    makeAppx.exe pack /d "$innoDir\make_appx" /p "$innoDir\zed_explorer_command_injector.appx" /nv
+    $makeAppx = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" -File |
+        Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+    if (-not $makeAppx) { throw 'The Windows SDK Appx packager was not found' }
+    & $makeAppx.FullName pack /d "$innoDir\make_appx" /p "$innoDir\zed_explorer_command_injector.appx" /nv
 }
 
 function SignZedAndItsFriends {
@@ -350,8 +378,11 @@ function BuildInstaller {
         "ShellNameShort" = $appShellNameShort
         "AppUserId"      = $appUserId
         "Version"        = "$env:RELEASE_VERSION"
+        "NumericVersion" = ($env:RELEASE_VERSION -split '[-+]')[0]
         "SourceDir"      = "$env:ZED_WORKSPACE"
         "AppxFullName"   = $appAppxFullName
+        "AppxName"       = "$script:appxName"
+        "AppxPublisher"  = "$script:appxPublisher"
     }
 
     $defs = @()
@@ -363,7 +394,7 @@ function BuildInstaller {
     if($canCodeSign) {
         # Checked by zed.iss to decide whether to sign the installer.
         $env:ZED_SIGN_BUNDLE = "1"
-        $signTool = "powershell.exe -ExecutionPolicy Bypass -File $innoDir\sign.ps1 `$f"
+        $signTool = "pwsh.exe -NoProfile -ExecutionPolicy Bypass -File $innoDir\sign.ps1 `$f"
         $innoArgs += "/sDefaultsign=`"$signTool`""
     }
 
@@ -388,13 +419,24 @@ $debugArchive = "$CargoOutDir\zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.
 $debugStoreKey = "$env:ZED_RELEASE_CHANNEL/zed-$env:RELEASE_VERSION-$env:ZED_RELEASE_CHANNEL.dbg.zip"
 
 CheckEnvironmentVariables
-PrepareForBundle
-GenerateLicenses
-BuildZedAndItsFriends
-BuildRemoteServer
+if (-not $PackageOnly) {
+    PrepareForBundle
+    GenerateLicenses
+    BuildZedAndItsFriends
+    BuildRemoteServer
+    if ($BuildOnly) { exit 0 }
+} else {
+    foreach ($file in @('Zed.exe', 'cli.exe', 'auto_update_helper.exe', 'zed_explorer_command_injector.dll')) {
+        if (-not (Test-Path "$innoDir\$file")) { throw "Build output is missing: $file" }
+    }
+    foreach ($directory in @('make_appx', 'appx', 'bin', 'tools')) {
+        New-Item -ItemType Directory -Force "$innoDir\$directory" | Out-Null
+    }
+    BuildRemoteServer -SkipBuild
+}
 MakeAppx
 SignZedAndItsFriends
-ZipZedAndItsFriendsDebug
+if (-not $PackageOnly) { ZipZedAndItsFriendsDebug }
 DownloadAMDGpuServices
 DownloadConpty
 CollectFiles

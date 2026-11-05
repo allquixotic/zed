@@ -25,7 +25,9 @@ ChangesAssociations=true
 MinVersion=10.0.16299
 SourceDir={#SourceDir}
 AppVersion={#Version}
-VersionInfoVersion={#Version}
+VersionInfoVersion={#NumericVersion}
+VersionInfoTextVersion={#Version}
+VersionInfoProductTextVersion={#Version}
 ShowLanguageDialog=auto
 WizardStyle=modern
 
@@ -33,6 +35,7 @@ CloseApplications=force
 
 #if GetEnv("ZED_SIGN_BUNDLE") != ""
 SignTool=Defaultsign
+SignedUninstaller=yes
 #endif
 
 DefaultDirName={autopf}\{#AppName}
@@ -88,7 +91,7 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}.exe"; Tasks: de
 Filename: "{app}\{#AppExeName}.exe"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall; Check: WizardNotSilent
 
 [UninstallRun]
-Filename: "powershell.exe"; Parameters: "Invoke-Command -ScriptBlock {{Remove-AppxPackage -Package ""{#AppxFullName}""}"; Check: IsWindows11OrLater; Flags: shellexec waituntilterminated runhidden
+Filename: "powershell.exe"; Parameters: "-Command ""Get-AppxPackage -Name '{#AppxName}' | Where-Object {{$_.Publisher -eq '{#AppxPublisher}'} | Remove-AppxPackage"""; Check: IsWindows11OrLater; Flags: shellexec waituntilterminated runhidden
 
 [Registry]
 Root: HKCU; Subkey: "Software\Classes\.ascx\OpenWithProgids"; ValueType: none; ValueName: "{#RegValueName}"; Flags: deletevalue uninsdeletevalue; Tasks: associatewithfiles
@@ -1377,7 +1380,7 @@ procedure RemoveAppxPackage();
 var
   RemoveAppxPackageResultCode: Integer;
 begin
-  ShellExec('', 'powershell.exe', '-Command ' + AddQuotes('Remove-AppxPackage -Package ''{#AppxFullName}'''), '', SW_HIDE, ewWaitUntilTerminated, RemoveAppxPackageResultCode);
+  ShellExec('', 'powershell.exe', '-Command ' + AddQuotes('Get-AppxPackage -Name ''{#AppxName}'' | Where-Object {$_.Publisher -eq ''{#AppxPublisher}''} | Remove-AppxPackage'), '', SW_HIDE, ewWaitUntilTerminated, RemoveAppxPackageResultCode);
   if not WizardIsTaskSelected('addcontextmenufiles') then begin
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\{#RegValueName}ContextMenu');
   end;

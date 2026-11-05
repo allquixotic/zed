@@ -1,8 +1,13 @@
-name: GPUI software Windows release
+name: Signed GPUI software Windows release
 on:
   push:
     branches: ['release/gpui-software-v*']
   workflow_dispatch:
+    inputs:
+      run_tests:
+        description: Run platform and renderer tests before building
+        type: boolean
+        default: true
 permissions:
   contents: read
 concurrency:
@@ -13,20 +18,20 @@ env:
   CARGO_INCREMENTAL: '0'
 jobs:
   linux:
+    if: inputs.run_tests
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
-      - name: Install Linux dependencies
-        run: ./script/linux
+        with:
+          persist-credentials: false
+      - run: ./script/linux
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a
         with:
           cache-on-failure: true
-      - name: Check Linux presenters
-        run: cargo check --locked -p gpui_linux -p gpui_renderer_bench
-      - name: Test portable CPU rendering
-        run: cargo test --locked -p gpui -p gpui_software --lib
-  windows:
+      - run: cargo check --locked -p gpui_linux -p gpui_renderer_bench
+      - run: cargo test --locked -p gpui -p gpui_software --lib
+  build:
     runs-on: windows-2022
     timeout-minutes: 330
     env:
@@ -34,6 +39,8 @@ jobs:
       GPUI_RENDERER: software
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
       - name: Initialize Rust and Visual Studio
         shell: pwsh
         run: |
@@ -48,25 +55,131 @@ jobs:
           }
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a
         with:
+          shared-key: windows-software-no-lto
           cache-on-failure: true
+      - name: Verify tested rendering source when reusing test results
+        if: '!inputs.run_tests'
+        shell: pwsh
+        run: |
+          git fetch --no-tags --depth=1 origin 60e91b9e842ff2a76bbd5db371d0760262a578b7
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git diff --exit-code 60e91b9e842ff2a76bbd5db371d0760262a578b7 HEAD -- crates/gpui crates/gpui_software crates/gpui_windows crates/gpui_linux crates/gpui_macos crates/gpui_platform
+          exit $LASTEXITCODE
       - name: Test native Windows and CPU rendering
+        if: inputs.run_tests
         env:
           GPUI_D3D_ADAPTER: warp
         shell: pwsh
         run: cargo test --locked -p gpui -p gpui_software -p gpui_windows --lib
-      - name: Build optimized Windows x64 installer
+      - name: Build optimized Windows x64 payload without LTO
         shell: pwsh
-        run: ./script/bundle-windows.ps1 -Architecture x86_64
-      - name: Record provenance and checksums
+        run: |
+          ./script/bundle-windows.ps1 -Architecture x86_64 -BuildOnly
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git diff --exit-code -- Cargo.lock
+          exit $LASTEXITCODE
+      - name: Record build input hashes
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          git diff --exit-code -- Cargo.lock
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $files = @(Get-ChildItem inno/x86_64 -File -Recurse) + @(Get-Item target/x86_64-pc-windows-msvc/release/remote_server.exe)
+          [ordered]@{
+            source_commit = $env:GITHUB_SHA
+            version = '1.27.0-software'
+            lto = $false
+            codegen_units = 16
+            rustc = (rustc --version)
+            files = @($files | ForEach-Object {
+              [ordered]@{path = [IO.Path]::GetRelativePath($env:GITHUB_WORKSPACE, $_.FullName); sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+            })
+          } | ConvertTo-Json -Depth 6 | Set-Content BUILD-INPUT.json
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: windows-unsigned-bundle-inputs
+          compression-level: 0
+          retention-days: 7
+          path: |
+            inno/x86_64/**
+            target/x86_64-pc-windows-msvc/release/remote_server.exe
+            BUILD-INPUT.json
+          if-no-files-found: error
+  sign:
+    needs: [build, linux]
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.linux.result == 'success' || needs.linux.result == 'skipped') }}
+    runs-on: windows-2022
+    timeout-minutes: 45
+    environment: azure-artifact-signing
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: windows-unsigned-bundle-inputs
+          path: .
+      - name: Verify build provenance and restore signing scripts from source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = Get-Content BUILD-INPUT.json -Raw | ConvertFrom-Json
+          if ($manifest.source_commit -ne $env:GITHUB_SHA -or $manifest.version -ne '1.27.0-software' -or $manifest.lto) { throw 'Unexpected build provenance' }
+          foreach ($file in $manifest.files) {
+            if ((Get-FileHash $file.path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $file.sha256) { throw "Build input hash mismatch: $($file.path)" }
+          }
+          Copy-Item crates/zed/resources/windows/sign.ps1 inno/x86_64/sign.ps1 -Force
+          Copy-Item crates/zed/resources/windows/zed.iss inno/x86_64/zed.iss -Force
+      - name: Azure login for Artifact Signing (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Install the signing module used by the pinned Trusted Signing action
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) { Register-PSRepository -Default -ErrorAction Stop }
+          Install-Module -Name TrustedSigning -RequiredVersion 0.5.8 -Scope CurrentUser -Force -Repository PSGallery
+      - name: Sign payload, Explorer package, installer and uninstaller
+        shell: pwsh
+        env:
+          ZED_SIGNING_AUTH: azure-cli
+          ACCOUNT_NAME: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          CERT_PROFILE_NAME: ${{ vars.AZURE_CERTIFICATE_PROFILE }}
+          ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          FILE_DIGEST: SHA256
+          TIMESTAMP_DIGEST: SHA256
+          TIMESTAMP_SERVER: http://timestamp.acs.microsoft.com
+          ZED_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+          ZED_SIGNING_EVIDENCE: ${{ runner.temp }}/zed-signing-events.jsonl
+        run: ./script/bundle-windows.ps1 -Architecture x86_64 -PackageOnly -RequireSigning
+      - name: Verify signed release and record provenance
+        shell: pwsh
+        env:
+          ZED_WINDOWS_PUBLISHER: ${{ vars.WINDOWS_PUBLISHER }}
+        run: |
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force release-artifacts | Out-Null
-          $name = "Zed-GPUI-Software-v1.27.0-$($env:GITHUB_SHA.Substring(0,10))-windows-x64.exe"
+          $name = "Zed-v1.27.0-software-$($env:GITHUB_SHA.Substring(0,10))-windows-x64.exe"
           Copy-Item target/Zed-x86_64.exe "release-artifacts/$name"
           Copy-Item target/zed-remote-server-windows-x86_64.zip release-artifacts/
-          $manifest = [ordered]@{
+          $owned = @('inno/x86_64/Zed.exe', 'inno/x86_64/bin/zed.exe', 'inno/x86_64/tools/auto_update_helper.exe', 'inno/x86_64/appx/zed_explorer_command_injector.dll', 'inno/x86_64/appx/zed_explorer_command_injector.appx', 'target/x86_64-pc-windows-msvc/release/remote_server.exe', "release-artifacts/$name")
+          $signatures = @($owned | ForEach-Object {
+            $signature = Get-AuthenticodeSignature -LiteralPath $_
+            if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -ne $env:ZED_WINDOWS_PUBLISHER -or $null -eq $signature.TimeStamperCertificate) { throw "Signature verification failed: $_" }
+            [ordered]@{path = $_; sha256 = (Get-FileHash $_ -Algorithm SHA256).Hash.ToLowerInvariant(); publisher = $signature.SignerCertificate.Subject; certificate_sha1 = $signature.SignerCertificate.Thumbprint; timestamp_publisher = $signature.TimeStamperCertificate.Subject}
+          })
+          [ordered]@{source_commit = $env:GITHUB_SHA; signatures = $signatures; signing_events = @(Get-Content "$env:RUNNER_TEMP/zed-signing-events.jsonl" | ForEach-Object { $_ | ConvertFrom-Json })} | ConvertTo-Json -Depth 6 | Set-Content release-artifacts/windows-signing.json
+          $build = Get-Content BUILD-INPUT.json -Raw | ConvertFrom-Json
+          [ordered]@{
             source_commit = $env:GITHUB_SHA
+            version = '1.27.0-software'
             upstream_tag = 'v1.27.0'
             upstream_commit = 'c84af5b99cbc366d675064e52b23664a015b6e35'
             software_source = '5f91feb67fc71d7e08098ba1bd2bf4e72b58d76d'
@@ -74,20 +187,37 @@ jobs:
             gpui_fast_components = @('bounds_tree', 'scene_sort', 'path_cache')
             channel = 'dev'
             target = 'x86_64-pc-windows-msvc'
-            signed = $false
-            profile = 'release with upstream bundle-config'
-            rustc = (rustc --version)
+            signed = $true
+            publisher = $env:ZED_WINDOWS_PUBLISHER
+            lto = $false
+            codegen_units = 16
+            software_opt_level = 3
+            rustc = $build.rustc
+            functional_tests = 'https://github.com/allquixotic/zed/actions/runs/42062855502'
             action_run = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
             payload = @(Get-ChildItem inno/x86_64 -File -Recurse | ForEach-Object {
               [ordered]@{path = [IO.Path]::GetRelativePath((Resolve-Path inno/x86_64), $_.FullName); sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
             })
-          }
-          $manifest | ConvertTo-Json -Depth 6 | Set-Content release-artifacts/build-manifest.json
+          } | ConvertTo-Json -Depth 6 | Set-Content release-artifacts/build-manifest.json
+      - name: Attest final signed release files
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: |
+            release-artifacts/*.exe
+            release-artifacts/*.zip
+            release-artifacts/build-manifest.json
+            release-artifacts/windows-signing.json
+      - name: Final checksums
+        shell: pwsh
+        run: |
+          Copy-Item '${{ steps.provenance.outputs.bundle-path }}' release-artifacts/provenance.sigstore.json
           Get-ChildItem release-artifacts -File | Sort-Object Name | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
           } | Set-Content release-artifacts/SHA256SUMS.txt
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
           name: gpui-software-windows-x64
+          compression-level: 0
           path: release-artifacts/*
           if-no-files-found: error

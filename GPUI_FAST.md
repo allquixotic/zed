@@ -10,4 +10,8 @@ The scene sorter preserves Zed stable's ordering of sprites within each draw ord
 
 The software renderer is ported from `allquixotic/zed`'s `feature/gpui-software` at `5f91feb67fc71d7e08098ba1bd2bf4e72b58d76d`. The release branch starts at upstream stable `v1.27.0` (`c84af5b99cbc366d675064e52b23664a015b6e35`). No fork-specific Bedrock changes are included.
 
-Build the Windows x64 Dev-channel installer with `script/bundle-windows.ps1 -Architecture x86_64`. The Dev channel keeps it separate from the official stable installation. Set `GPUI_RENDERER=software` before launch to force software rendering.
+This release is version `1.27.0-software`. The bundle configuration disables LTO and uses 16 codegen units to fit hosted runners, while keeping all renderer crates at optimization level 3. These Cargo settings apply across platforms.
+
+The Windows release workflow builds without signing credentials, then verifies the build inputs and signs them in a separate hosted job using Azure OIDC. It requires timestamped signatures from Sean McNamara on the application, helper binaries, Explorer package, installer and uninstaller, and publishes a GitHub provenance attestation.
+
+For a local unsigned build, use `script/bundle-windows.ps1 -Architecture x86_64`. The Dev channel keeps it separate from the official stable installation. Set `GPUI_RENDERER=software` before launch to force software rendering.

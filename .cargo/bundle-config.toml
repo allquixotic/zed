@@ -1,5 +1,7 @@
 [profile.release]
 opt-level = "z"
+lto = false
+codegen-units = 16
 
 [profile.release.package]
 "*" = { opt-level = 3 }
@@ -23,7 +25,7 @@ rope = { opt-level = 3 }
 scheduler = { opt-level = 3 }
 sum_tree = { opt-level = 3 }
 text = { opt-level = 3 }
-zed = { codegen-units = 1 }
+zed = { codegen-units = 16 }
 
 [target.'cfg(target_os = "linux")']
 rustflags = ["-C", "link-args=-Wl,--disable-new-dtags,-rpath,$ORIGIN/../lib"]

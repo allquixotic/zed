@@ -3,6 +3,7 @@ param (
     [string]$filePath
 )
 
+$ErrorActionPreference = 'Stop'
 $params = @{}
 
 $endpoint = $ENV:ENDPOINT
@@ -43,6 +44,14 @@ $params["TimestampRfc3161"] = $timeStampServer
 
 $params["Files"] = $filePath
 
+if ($env:ZED_SIGNING_AUTH -eq 'azure-cli') {
+    Import-Module TrustedSigning -RequiredVersion 0.5.8 -ErrorAction Stop
+    foreach ($credential in @('Environment', 'WorkloadIdentity', 'ManagedIdentity', 'SharedTokenCache', 'VisualStudio', 'VisualStudioCode', 'AzurePowerShell', 'AzureDeveloperCli', 'InteractiveBrowser')) {
+        $params["Exclude${credential}Credential"] = $true
+    }
+    $params['ExcludeAzureCliCredential'] = $false
+}
+
 $trace = $ENV:TRACE
 if (-Not [string]::IsNullOrWhiteSpace($trace)) {
     if ([System.Convert]::ToBoolean($trace)) {
@@ -51,3 +60,23 @@ if (-Not [string]::IsNullOrWhiteSpace($trace)) {
 }
 
 Invoke-TrustedSigning @params
+
+if ($env:ZED_WINDOWS_PUBLISHER) {
+    foreach ($file in ($filePath -split ',')) {
+        $signature = Get-AuthenticodeSignature -LiteralPath $file
+        if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -ne $env:ZED_WINDOWS_PUBLISHER -or $null -eq $signature.TimeStamperCertificate) {
+            throw "Missing, invalid, untimestamped or unexpected signature: $file ($($signature.Status))"
+        }
+        $record = [ordered]@{
+            file = [IO.Path]::GetFileName($file)
+            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
+            publisher = $signature.SignerCertificate.Subject
+            certificate_sha1 = $signature.SignerCertificate.Thumbprint
+            timestamp_publisher = $signature.TimeStamperCertificate.Subject
+        }
+        if ($env:ZED_SIGNING_EVIDENCE) {
+            $record | ConvertTo-Json -Compress | Add-Content -Encoding utf8 $env:ZED_SIGNING_EVIDENCE
+        }
+        Write-Host "Verified timestamped signature: $file"
+    }
+}
