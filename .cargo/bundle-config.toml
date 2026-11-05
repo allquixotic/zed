@@ -11,6 +11,7 @@ gpui_linux = { opt-level = 3 }
 gpui_macos = { opt-level = 3 }
 gpui_platform = { opt-level = 3 }
 gpui_shared_string = { opt-level = 3 }
+gpui_software = { opt-level = 3 }
 gpui_util = { opt-level = 3 }
 gpui_wgpu = { opt-level = 3 }
 gpui_windows = { opt-level = 3 }
