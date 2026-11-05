@@ -1,0 +1,85 @@
+name: GPUI software Windows release
+on:
+  push:
+    branches: ['release/gpui-software-v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: gpui-software-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Install Linux dependencies
+        run: ./script/linux
+      - name: Check Linux presenters
+        run: cargo check --locked -p gpui_linux -p gpui_renderer_bench
+      - name: Test portable CPU rendering
+        run: cargo test --locked -p gpui -p gpui_software --lib
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 330
+    env:
+      CARGO_BUILD_JOBS: '4'
+      GPUI_RENDERER: software
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - name: Initialize Rust and Visual Studio
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          & "$visualStudio\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64
+          rustup show
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem Env: | Where-Object { $_.Name -match '^(PATH|INCLUDE|LIB|LIBPATH|VCToolsInstallDir|VSINSTALLDIR|WindowsSdkDir|WindowsSDKVersion)$' } | ForEach-Object {
+            "$($_.Name)=$($_.Value)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+      - name: Test native Windows and CPU rendering
+        shell: pwsh
+        run: cargo test --locked -p gpui -p gpui_software -p gpui_windows --lib
+      - name: Build optimized Windows x64 installer
+        shell: pwsh
+        run: ./script/bundle-windows.ps1 -Architecture x86_64
+      - name: Record provenance and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force release-artifacts | Out-Null
+          $name = "Zed-GPUI-Software-v1.27.0-$($env:GITHUB_SHA.Substring(0,10))-windows-x64.exe"
+          Copy-Item target/Zed-x86_64.exe "release-artifacts/$name"
+          Copy-Item target/zed-remote-server-windows-x86_64.zip release-artifacts/
+          $manifest = [ordered]@{
+            source_commit = $env:GITHUB_SHA
+            upstream_tag = 'v1.27.0'
+            upstream_commit = 'c84af5b99cbc366d675064e52b23664a015b6e35'
+            software_source = '5f91feb67fc71d7e08098ba1bd2bf4e72b58d76d'
+            gpui_fast_source = '86a8228229c8646b552d747434ffd690216a872c'
+            gpui_fast_components = @('bounds_tree', 'scene_sort', 'path_cache')
+            channel = 'dev'
+            target = 'x86_64-pc-windows-msvc'
+            signed = $false
+            profile = 'release with upstream bundle-config'
+            rustc = (rustc --version)
+            action_run = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            payload = @(Get-ChildItem inno/x86_64 -File -Recurse | ForEach-Object {
+              [ordered]@{path = [IO.Path]::GetRelativePath((Resolve-Path inno/x86_64), $_.FullName); sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()}
+            })
+          }
+          $manifest | ConvertTo-Json -Depth 6 | Set-Content release-artifacts/build-manifest.json
+          Get-ChildItem release-artifacts -File | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          } | Set-Content release-artifacts/SHA256SUMS.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: gpui-software-windows-x64
+          path: release-artifacts/*
+          if-no-files-found: error

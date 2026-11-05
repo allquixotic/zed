@@ -31,6 +31,7 @@ use wayland_protocols::{
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
+use crate::linux::wayland::software_renderer::{WaylandRenderer, WaylandRendererKind};
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
@@ -44,7 +45,7 @@ use gpui::{
     popup::PopupOptions,
     px, size,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
+use gpui_wgpu::{CompositorGpuHint, WgpuSurfaceConfig, wgpu};
 
 #[derive(Default)]
 pub(crate) struct Callbacks {
@@ -63,7 +64,7 @@ pub(crate) struct Callbacks {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RawWindow {
+pub(super) struct RawWindow {
     window: *mut c_void,
     display: *mut c_void,
 }
@@ -113,9 +114,7 @@ pub struct WaylandWindowState {
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
     globals: Globals,
-    /// Taken when the window is dropped. Its GPU objects use the Wayland connection, so they
-    /// mustn't outlive the window, which a display mode switch relies on.
-    renderer: Option<WgpuRenderer>,
+    renderer: Option<WaylandRenderer>,
     bounds: Bounds<Pixels>,
     scale: f32,
     input_handler: Option<PlatformInputHandler>,
@@ -561,6 +560,7 @@ impl WaylandWindowState {
         client: WaylandClientStatePtr,
         globals: Globals,
         gpu_context: gpui_wgpu::GpuContext,
+        renderer_kind: Rc<Cell<WaylandRendererKind>>,
         compositor_gpu: Option<CompositorGpuHint>,
         options: WindowParams,
         parent: Option<WaylandWindowStatePtr>,
@@ -584,7 +584,14 @@ impl WaylandWindowState {
                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
-            WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
+            WaylandRenderer::new(
+                &renderer_kind,
+                gpu_context,
+                &raw_window,
+                config,
+                compositor_gpu,
+                &globals,
+            )?
         };
 
         if let WaylandSurfaceState::Xdg(ref xdg_state) = surface_state {
@@ -832,6 +839,7 @@ impl WaylandWindow {
         handle: AnyWindowHandle,
         globals: Globals,
         gpu_context: gpui_wgpu::GpuContext,
+        renderer_kind: Rc<Cell<WaylandRendererKind>>,
         compositor_gpu: Option<CompositorGpuHint>,
         client: WaylandClientStatePtr,
         params: WindowParams,
@@ -870,6 +878,7 @@ impl WaylandWindow {
                 client,
                 globals,
                 gpu_context,
+                renderer_kind,
                 compositor_gpu,
                 params,
                 parent,
@@ -1903,6 +1912,14 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut state = self.borrow_mut();
+        if state
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.is_software())
+        {
+            state.background_appearance = WindowBackgroundAppearance::Opaque;
+            return;
+        }
         if state.background_appearance == background_appearance {
             return;
         }
@@ -1912,17 +1929,23 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
-        self.borrow().background_appearance
+        let state = self.borrow();
+        if state
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.is_software())
+        {
+            WindowBackgroundAppearance::Opaque
+        } else {
+            state.background_appearance
+        }
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        let client = self.borrow().client.get_client();
-        let state = client.borrow();
-        state
-            .gpu_context
-            .borrow()
+        self.borrow()
+            .renderer
             .as_ref()
-            .is_some_and(|ctx| ctx.supports_dual_source_blending())
+            .is_some_and(|renderer| renderer.supports_subpixel_rendering())
     }
 
     fn minimize(&self) {
@@ -2043,7 +2066,8 @@ impl PlatformWindow for WaylandWindow {
             let callback = state.surface.frame(&state.globals.qh, state.surface.id());
             state.pending_frame_callback = Some(callback);
         }
-        if renderer.draw(scene) {
+        let surface = state.surface.clone();
+        if renderer.draw(scene, &surface) {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
         } else {
@@ -2066,7 +2090,6 @@ impl PlatformWindow for WaylandWindow {
             .as_ref()
             .expect("the renderer is only taken when the window is dropped")
             .sprite_atlas()
-            .clone()
     }
 
     fn show_window_menu(&self, position: Point<Pixels>) {

@@ -30,11 +30,13 @@ mod app;
 mod arena;
 mod asset_cache;
 mod assets;
+#[path = "fast/bounds_tree.rs"]
 mod bounds_tree;
 mod color;
 mod element;
 mod elements;
 mod executor;
+mod fast;
 mod geometry;
 mod gestures;
 mod global;

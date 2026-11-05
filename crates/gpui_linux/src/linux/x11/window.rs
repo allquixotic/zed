@@ -10,7 +10,7 @@ use gpui::{
     WindowDecorations, WindowKind, WindowParams, WindowVisibility, popup::PopupNotSupportedError,
     px,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{CompositorGpuHint, WgpuSurfaceConfig};
 
 use collections::FxHashSet;
 use gpui_util::{ResultExt, maybe};
@@ -33,6 +33,7 @@ use std::{
     cell::RefCell, ffi::c_void, fmt::Display, num::NonZeroU32, ptr::NonNull, rc::Rc, sync::Arc,
 };
 
+use super::software_renderer::X11Renderer;
 use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
 
 x11rb::atom_manager! {
@@ -228,7 +229,7 @@ fn find_visuals(xcb: &XCBConnection, screen_index: usize) -> VisualSet {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RawWindow {
+pub(super) struct RawWindow {
     connection: *mut c_void,
     screen_id: usize,
     window_id: u32,
@@ -269,9 +270,7 @@ pub struct X11WindowState {
     pub(crate) last_sync_counter: Option<sync::Int64>,
     bounds: Bounds<Pixels>,
     scale_factor: f32,
-    /// Taken when the window is dropped. Its GPU objects use the X connection, so they mustn't
-    /// outlive the window, which a display mode switch relies on.
-    renderer: Option<WgpuRenderer>,
+    renderer: Option<X11Renderer>,
     display: Rc<dyn PlatformDisplay>,
     input_handler: Option<PlatformInputHandler>,
     appearance: WindowAppearance,
@@ -776,7 +775,7 @@ impl X11WindowState {
                     transparent: false,
                     preferred_present_mode: None,
                 };
-                WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
+                X11Renderer::new(gpu_context, raw_window, config, compositor_gpu)?
             };
 
             renderer.set_subpixel_layout(is_bgr);
@@ -1636,18 +1635,9 @@ impl PlatformWindow for X11Window {
         self.0
             .state
             .borrow()
-            .client
-            .0
-            .upgrade()
-            .map(|ref_cell| {
-                let state = ref_cell.borrow();
-                state
-                    .gpu_context
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|ctx| ctx.supports_dual_source_blending())
-            })
-            .unwrap_or_default()
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.supports_subpixel_rendering())
     }
 
     fn minimize(&self) {
@@ -1775,7 +1765,7 @@ impl PlatformWindow for X11Window {
             return;
         }
 
-        renderer.draw(scene);
+        renderer.draw(scene, &self.0.xcb);
 
         if renderer.needs_redraw() {
             inner.force_render_after_recovery = true;

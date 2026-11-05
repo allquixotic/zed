@@ -23,11 +23,11 @@ pub enum PathStyle {
 
 /// A [`Path`] builder.
 pub struct PathBuilder {
-    raw: lyon::path::builder::WithSvg<lyon::path::BuilderImpl>,
-    transform: Option<lyon::math::Transform>,
+    pub(crate) raw: lyon::path::builder::WithSvg<lyon::path::BuilderImpl>,
+    pub(crate) transform: Option<lyon::math::Transform>,
     /// PathStyle of the PathBuilder
     pub style: PathStyle,
-    dash_array: Option<Vec<Pixels>>,
+    pub(crate) dash_array: Option<Vec<Pixels>>,
 }
 
 impl From<lyon::path::Builder> for PathBuilder {
@@ -242,19 +242,10 @@ impl PathBuilder {
     /// Builds into a [`Path`].
     #[inline]
     pub fn build(self) -> Result<Path<Pixels>, Error> {
-        let path = if let Some(transform) = self.transform {
-            self.raw.build().transformed(&transform)
-        } else {
-            self.raw.build()
-        };
-
-        match self.style {
-            PathStyle::Stroke(options) => Self::tessellate_stroke(self.dash_array, &path, &options),
-            PathStyle::Fill(options) => Self::tessellate_fill(&path, &options),
-        }
+        crate::fast::path_cache::build(self)
     }
 
-    fn tessellate_fill(
+    pub(crate) fn tessellate_fill(
         path: &lyon::path::Path,
         options: &FillOptions,
     ) -> Result<Path<Pixels>, Error> {
@@ -272,7 +263,7 @@ impl PathBuilder {
         Ok(Self::build_path(buf))
     }
 
-    fn tessellate_stroke(
+    pub(crate) fn tessellate_stroke(
         dash_array: Option<Vec<Pixels>>,
         path: &lyon::path::Path,
         options: &StrokeOptions,
